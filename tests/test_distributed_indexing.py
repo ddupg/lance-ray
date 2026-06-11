@@ -1535,6 +1535,13 @@ def test_build_distributed_vector_index(tmp_path, index_type):
 
     assert result.num_rows == 5
 
+    plan = updated_dataset.scanner(
+        nearest={"column": "vector", "q": q, "k": 5},
+        columns=["id"],
+    ).explain_plan()
+    assert "ANNSubIndex" in plan
+    assert f"idx_{index_type}" in plan
+
 
 @pytest.mark.parametrize("index_type", ["IVF_FLAT", "IVF_PQ"])
 def test_distributed_nested_vector_index_and_search(tmp_path, index_type):

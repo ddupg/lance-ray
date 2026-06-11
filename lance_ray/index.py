@@ -1309,18 +1309,10 @@ def create_index(
     if not successful_results:
         raise RuntimeError("No successful vector index creation results found")
 
-    segment_indices = [r["segment_index"] for r in successful_results]
-    segment_builder = (
-        dataset_obj.create_index_segment_builder()
-        .with_index_type(index_type_name)
-        .with_segments(segment_indices)
-    )
-    segments = segment_builder.build_all()
-
     updated_dataset = dataset_obj.commit_existing_index_segments(
         index_name=name,
         column=column,
-        segments=segments,
+        segments=[r["segment_index"] for r in successful_results],
     )
 
     logger.info(

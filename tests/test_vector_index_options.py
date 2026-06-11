@@ -101,19 +101,6 @@ class _FakeFragment:
         return self._rows
 
 
-class _FakeSegmentBuilder:
-    def with_index_type(self, index_type):
-        self.index_type = index_type
-        return self
-
-    def with_segments(self, segments):
-        self.segments = segments
-        return self
-
-    def build_all(self):
-        return ["merged_segment"]
-
-
 class _FakeDataset:
     uri = "memory://fake"
     schema = _FakeSchema()
@@ -131,9 +118,6 @@ class _FakeDataset:
 
     def create_scalar_index(self, **kwargs):
         self.scalar_index_kwargs = kwargs
-
-    def create_index_segment_builder(self):
-        return _FakeSegmentBuilder()
 
     def create_index_uncommitted(self, **kwargs):
         self.vector_index_kwargs = kwargs
@@ -265,6 +249,7 @@ def test_create_index_uses_sample_rate_for_global_training(monkeypatch):
     assert captured["fragment_handler_kwargs"]["ivf_centroids"] == "ivf_ref"
     assert captured["fragment_handler_kwargs"]["pq_codebook"] == "pq_ref"
     assert "sample_rate" not in captured["fragment_handler_kwargs"]
+    assert fake_dataset.commit_kwargs["segments"] == ["segment"]
 
 
 def test_create_index_rejects_non_positive_sample_rate(monkeypatch):
@@ -420,6 +405,7 @@ def test_create_index_passes_block_size_to_loads_and_handler(monkeypatch):
     assert [load["block_size"] for load in captured["loads"]] == [8192, 8192]
     assert captured["fragment_handler_kwargs"]["block_size"] == 8192
     assert captured["put_artifacts"] == ("ivf_centroids", "pq_codebook")
+    assert fake_dataset.commit_kwargs["segments"] == ["segment"]
 
 
 def test_fragment_handlers_pass_block_size_to_dataset_load(monkeypatch):
