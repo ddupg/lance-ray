@@ -439,6 +439,20 @@ def test_create_index_rejects_non_positive_sample_rate(monkeypatch):
         )
 
 
+def test_create_index_rejects_invalid_num_segments(monkeypatch):
+    """Invalid segment counts should fail before training starts."""
+
+    monkeypatch.setattr(index_mod, "_check_pylance_version", lambda: None)
+
+    with pytest.raises(ValueError, match="num_segments must be positive, got 0"):
+        index_mod.create_index(
+            uri=_FakeDataset(),
+            column="vector",
+            index_type="IVF_PQ",
+            num_segments=0,
+        )
+
+
 @pytest.mark.parametrize("index_type", ["BTREE", "BITMAP", "INVERTED", "FTS"])
 def test_create_scalar_index_uses_segment_path(monkeypatch, index_type):
     """Migrated scalar indexes should use Lance's segment workflow."""

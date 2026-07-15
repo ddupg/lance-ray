@@ -54,30 +54,30 @@ def _index_exists(dataset: LanceDataset, name: str) -> bool:
 
 
 def _distribute_fragments_balanced(
-    fragments: list[Any], num_workers: int, logger: logging.Logger
+    fragments: list[Any], num_segments: int, logger: logging.Logger
 ) -> list[list[int]]:
-    """Distribute fragments across workers using a balanced algorithm.
+    """Distribute fragments across index segments using a balanced algorithm.
 
     This function implements a greedy algorithm that assigns fragments to the
-    worker with the currently smallest total workload, helping to balance the
-    processing time across workers.
+    segment with the currently smallest total workload, helping to balance the
+    processing time across segment batches.
 
     Parameters
     ----------
     fragments : list
         List of Lance fragment objects.
-    num_workers : int
-        Number of workers to distribute fragments across.
+    num_segments : int
+        Number of segment batches to distribute fragments across.
     logger : logging.Logger
         Logger instance for debugging information.
 
     Returns
     -------
     list[list[int]]
-        Each inner list contains fragment IDs for one worker.
+        Each inner list contains fragment IDs for one segment batch.
     """
     if not fragments:
-        return [[] for _ in range(num_workers)]
+        return [[] for _ in range(num_segments)]
 
     fragment_info: list[dict[str, int]] = []
     for fragment in fragments:
@@ -100,35 +100,36 @@ def _distribute_fragments_balanced(
     # This helps with better load balancing using the greedy algorithm
     fragment_info.sort(key=lambda x: x["size"], reverse=True)
 
-    worker_batches: list[list[int]] = [[] for _ in range(num_workers)]
-    worker_workloads = [0] * num_workers
+    segment_batches: list[list[int]] = [[] for _ in range(num_segments)]
+    segment_workloads = [0] * num_segments
 
-    # Greedy assignment: assign each fragment to the worker with minimum workload
+    # Greedy assignment: assign each fragment to the segment with minimum workload
     for frag_info in fragment_info:
-        # Find the worker with the minimum current workload
-        min_workload_idx = min(range(num_workers), key=lambda i: worker_workloads[i])
-        worker_batches[min_workload_idx].append(frag_info["id"])
-        worker_workloads[min_workload_idx] += frag_info["size"]
+        min_workload_idx = min(
+            range(num_segments), key=lambda i: segment_workloads[i]
+        )
+        segment_batches[min_workload_idx].append(frag_info["id"])
+        segment_workloads[min_workload_idx] += frag_info["size"]
 
     total_size = sum(info["size"] for info in fragment_info)
     logger.info("Fragment distribution statistics:")
     logger.info("  Total fragments: %d", len(fragment_info))
     logger.info("  Total size: %d", total_size)
-    logger.info("  Workers: %d", num_workers)
+    logger.info("  Segments: %d", num_segments)
 
     for i, (batch, workload) in enumerate(
-        zip(worker_batches, worker_workloads, strict=False)
+        zip(segment_batches, segment_workloads, strict=False)
     ):
         percentage = (workload / total_size * 100) if total_size > 0 else 0
         logger.info(
-            "  Worker %d: %d fragments, workload: %d (%.1f%%)",
+            "  Segment %d: %d fragments, workload: %d (%.1f%%)",
             i,
             len(batch),
             workload,
             percentage,
         )
 
-    non_empty_batches = [batch for batch in worker_batches if batch]
+    non_empty_batches = [batch for batch in segment_batches if batch]
     return non_empty_batches
 
 
@@ -162,6 +163,16 @@ def _map_async_with_pool(
         pool.join()
 
     return results
+
+
+def _resolve_num_segments(num_workers: int, num_segments: Optional[int]) -> int:
+    if num_workers <= 0:
+        raise ValueError(f"num_workers must be positive, got {num_workers}")
+    if num_segments is None:
+        return num_workers
+    if num_segments <= 0:
+        raise ValueError(f"num_segments must be positive, got {num_segments}")
+    return num_segments
 
 
 def _is_ray_object_ref(value: Any) -> bool:
@@ -414,6 +425,7 @@ def create_scalar_index(
     fragment_ids: Optional[list[int]] = None,
     index_uuid: Optional[str] = None,
     num_workers: int = 4,
+    num_segments: Optional[int] = None,
     storage_options: Optional[dict[str, str]] = None,
     block_size: Optional[int] = None,
     namespace_impl: Optional[str] = None,
@@ -436,7 +448,9 @@ def create_scalar_index(
         train: Whether to train the index (default: True).
         fragment_ids: Optional list of fragment IDs to build index on.
         index_uuid: Optional fragment UUID for distributed indexing.
-        num_workers: Number of Ray workers to use (keyword-only).
+        num_workers: Maximum number of Ray Pool workers to use (keyword-only).
+        num_segments: Number of fragment batches / index segments to create
+            (keyword-only). Defaults to num_workers for backwards compatibility.
         storage_options: Storage options for the dataset (keyword-only).
         block_size: Block size in bytes to use when loading the dataset (keyword-only).
         namespace_impl: The namespace implementation type (e.g., "rest", "dir").
@@ -486,8 +500,7 @@ def create_scalar_index(
     if not column:
         raise ValueError("Column name cannot be empty")
 
-    if num_workers <= 0:
-        raise ValueError(f"num_workers must be positive, got {num_workers}")
+    requested_num_segments = _resolve_num_segments(num_workers, num_segments)
 
     if block_size is not None and block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}")
@@ -621,11 +634,25 @@ def create_scalar_index(
     else:
         fragment_ids_to_use = [fragment.fragment_id for fragment in fragments]
 
-    if num_workers > len(fragment_ids_to_use):
-        num_workers = len(fragment_ids_to_use)
-        logger.info("Adjusted num_workers to %d to match fragment count", num_workers)
+    if requested_num_segments > len(fragment_ids_to_use):
+        requested_num_segments = len(fragment_ids_to_use)
+        logger.info(
+            "Adjusted num_segments to %d to match fragment count",
+            requested_num_segments,
+        )
 
-    fragment_batches = _distribute_fragments_balanced(fragments, num_workers, logger)
+    fragment_batches = _distribute_fragments_balanced(
+        fragments, num_segments=requested_num_segments, logger=logger
+    )
+    pool_workers = min(num_workers, len(fragment_batches))
+    if pool_workers < num_workers:
+        logger.info(
+            "Limiting Ray Pool workers to %d (requested %d) because there are "
+            "only %d non-empty segment batches",
+            pool_workers,
+            num_workers,
+            len(fragment_batches),
+        )
 
     def create_fragment_handler() -> Any:
         if use_segment_workflow:
@@ -660,15 +687,17 @@ def create_scalar_index(
         )
 
     logger.info(
-        "Phase 1: Distributing scalar index build across %d workers for %d fragments",
+        "Phase 1: Distributing scalar index build across %d segment batches "
+        "using up to %d workers for %d fragments",
         len(fragment_batches),
+        pool_workers,
         len(fragment_ids_to_use),
     )
 
     results = _map_async_with_pool(
         create_fragment_handler=create_fragment_handler,
         fragment_batches=fragment_batches,
-        num_workers=num_workers,
+        num_workers=pool_workers,
         ray_remote_args=ray_remote_args,
         error_prefix="Failed to complete distributed index building",
     )
@@ -705,9 +734,10 @@ def create_scalar_index(
             name,
         )
         logger.info(
-            "Fragments: %d, Workers: %d",
+            "Fragments: %d, Segments: %d, Workers: %d",
             len(fragment_ids_to_use),
             len(fragment_batches),
+            pool_workers,
         )
         return updated_dataset
 
@@ -748,10 +778,11 @@ def create_scalar_index(
         name,
     )
     logger.info(
-        "Index ID: %s, Fragments: %d, Workers: %d",
+        "Index ID: %s, Fragments: %d, Segments: %d, Workers: %d",
         index_id,
         len(fragment_ids_to_use),
         len(fragment_batches),
+        pool_workers,
     )
     return updated_dataset
 
@@ -1165,6 +1196,7 @@ def create_index(
     *,
     replace: bool = True,
     num_workers: int = 4,
+    num_segments: Optional[int] = None,
     storage_options: Optional[dict[str, str]] = None,
     block_size: Optional[int] = None,
     namespace_impl: Optional[str] = None,
@@ -1196,7 +1228,9 @@ def create_index(
             "IVF_HNSW_PQ")
         name: Name of the index (generated if None)
         replace: Whether to replace existing index with the same name (default: True)
-        num_workers: Number of Ray workers to use (keyword-only)
+        num_workers: Maximum number of Ray Pool workers to use (keyword-only)
+        num_segments: Number of fragment batches / index segments to create
+            (keyword-only). Defaults to num_workers for backwards compatibility.
         storage_options: Storage options for the dataset (keyword-only)
         block_size: Block size in bytes to use when loading the dataset (keyword-only)
         ray_remote_args: Options for Ray tasks (keyword-only)
@@ -1222,8 +1256,7 @@ def create_index(
     if not column:
         raise ValueError("Column name cannot be empty")
 
-    if num_workers <= 0:
-        raise ValueError(f"num_workers must be positive, got {num_workers}")
+    requested_num_segments = _resolve_num_segments(num_workers, num_segments)
 
     if sample_rate <= 0:
         raise ValueError(f"sample_rate must be positive, got {sample_rate}")
@@ -1294,9 +1327,12 @@ def create_index(
 
     fragment_ids_to_use = [fragment.fragment_id for fragment in fragments]
 
-    if num_workers > len(fragment_ids_to_use):
-        num_workers = len(fragment_ids_to_use)
-        logger.info("Adjusted num_workers to %d to match fragment count", num_workers)
+    if requested_num_segments > len(fragment_ids_to_use):
+        requested_num_segments = len(fragment_ids_to_use)
+        logger.info(
+            "Adjusted num_segments to %d to match fragment count",
+            requested_num_segments,
+        )
 
     ivf_centroids_artifact = ivf_centroids
     pq_codebook_artifact = pq_codebook
@@ -1383,12 +1419,23 @@ def create_index(
         )
 
     fragment_batches = _distribute_fragments_balanced(
-        fragments, num_workers=num_workers, logger=logger
+        fragments, num_segments=requested_num_segments, logger=logger
     )
+    pool_workers = min(num_workers, len(fragment_batches))
+    if pool_workers < num_workers:
+        logger.info(
+            "Limiting Ray Pool workers to %d (requested %d) because there are "
+            "only %d non-empty segment batches",
+            pool_workers,
+            num_workers,
+            len(fragment_batches),
+        )
 
     logger.info(
-        "Phase 2: Distributing vector index build across %d workers for %d fragments",
+        "Phase 2: Distributing vector index build across %d segment batches "
+        "using up to %d workers for %d fragments",
         len(fragment_batches),
+        pool_workers,
         len(fragment_ids_to_use),
     )
 
@@ -1422,7 +1469,7 @@ def create_index(
     results = _map_async_with_pool(
         create_fragment_handler=create_fragment_handler,
         fragment_batches=fragment_batches,
-        num_workers=num_workers,
+        num_workers=pool_workers,
         ray_remote_args=ray_remote_args,
         error_prefix="Failed to complete distributed vector index building",
     )
@@ -1457,10 +1504,11 @@ def create_index(
         name,
     )
     logger.info(
-        "Index ID: %s, Fragments: %d, Workers: %d",
+        "Index ID: %s, Fragments: %d, Segments: %d, Workers: %d",
         index_id,
         len(fragment_ids_to_use),
         len(fragment_batches),
+        pool_workers,
     )
 
     return updated_dataset

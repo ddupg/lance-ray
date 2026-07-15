@@ -795,6 +795,7 @@ class TestDistributedIndexing:
             index_type="INVERTED",
             name="new_api_test_idx",
             num_workers=2,
+            num_segments=4,
             remove_stop_words=False,
         )
 
@@ -815,6 +816,7 @@ class TestDistributedIndexing:
         assert our_index.index_type == "Inverted", (
             f"Expected Inverted index, got {our_index.index_type}"
         )
+        assert len(our_index.segments) == 4
 
         # Test that the index works for searching
         sample_data = updated_dataset.take([0], columns=["text"])
@@ -1543,6 +1545,7 @@ def test_build_distributed_vector_index(tmp_path, index_type):
             index_type=index_type,
             name=f"idx_{index_type}",
             num_workers=2,
+            num_segments=4,
             num_partitions=4,
             num_sub_vectors=16,
             sample_rate=16,
@@ -1574,6 +1577,7 @@ def test_build_distributed_vector_index(tmp_path, index_type):
     assert vec_index.index_type == index_type, (
         f"Expected {index_type} vector index, got {vec_index.index_type}"
     )
+    assert len(vec_index.segments) == 4
 
     # Run a simple nearest-neighbor query to ensure the index is usable.
     q = [random.gauss(0, 1) for _ in range(128)]
