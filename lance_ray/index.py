@@ -448,7 +448,7 @@ def create_scalar_index(
         train: Whether to train the index (default: True).
         fragment_ids: Optional list of fragment IDs to build index on.
         index_uuid: Optional fragment UUID for distributed indexing.
-        num_workers: Number of Ray workers to use (keyword-only).
+        num_workers: Maximum number of Ray Pool workers to use (keyword-only).
         num_segments: Number of fragment batches / index segments to create
             (keyword-only). Defaults to num_workers for backwards compatibility.
         storage_options: Storage options for the dataset (keyword-only).
@@ -645,6 +645,14 @@ def create_scalar_index(
         fragments, num_segments=requested_num_segments, logger=logger
     )
     pool_workers = min(num_workers, len(fragment_batches))
+    if pool_workers < num_workers:
+        logger.info(
+            "Limiting Ray Pool workers to %d (requested %d) because there are "
+            "only %d non-empty segment batches",
+            pool_workers,
+            num_workers,
+            len(fragment_batches),
+        )
 
     def create_fragment_handler() -> Any:
         if use_segment_workflow:
@@ -1220,7 +1228,7 @@ def create_index(
             "IVF_HNSW_PQ")
         name: Name of the index (generated if None)
         replace: Whether to replace existing index with the same name (default: True)
-        num_workers: Number of Ray workers to use (keyword-only)
+        num_workers: Maximum number of Ray Pool workers to use (keyword-only)
         num_segments: Number of fragment batches / index segments to create
             (keyword-only). Defaults to num_workers for backwards compatibility.
         storage_options: Storage options for the dataset (keyword-only)
@@ -1414,6 +1422,14 @@ def create_index(
         fragments, num_segments=requested_num_segments, logger=logger
     )
     pool_workers = min(num_workers, len(fragment_batches))
+    if pool_workers < num_workers:
+        logger.info(
+            "Limiting Ray Pool workers to %d (requested %d) because there are "
+            "only %d non-empty segment batches",
+            pool_workers,
+            num_workers,
+            len(fragment_batches),
+        )
 
     logger.info(
         "Phase 2: Distributing vector index build across %d segment batches "

@@ -480,9 +480,9 @@ except ValueError as e:
 
 ### Performance Considerations
 
-- For very large datasets, it's recommended to use more powerful CPU/memory ray worker nodes. Increasing `num_workers` can improve index building speed, but requires more computational nodes.
-- Too many num_workers can cause large number of partitions, which cause FTS queries slowness as lots of index partitions need to be loaded when searching.
-- If `num_workers` is greater than the number of fragments, it will be automatically adjusted to match the fragment count
+- For very large datasets, use Ray worker nodes with sufficient CPU and memory. Increasing `num_workers` can improve index build speed when there are enough segment batches to process, but requires more cluster resources.
+- `num_segments` determines the number of index segments. More segments can slow FTS queries because more index segments need to be loaded during search.
+- `num_segments` is capped at the number of fragments, and `num_workers` is capped at the number of non-empty segment batches.
 
 ### Important Notes
 
