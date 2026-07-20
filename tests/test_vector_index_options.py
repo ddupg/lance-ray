@@ -178,8 +178,8 @@ def test_map_async_with_pool_closes_and_joins_pool(monkeypatch):
     ]
 
 
-def test_create_index_uses_sample_rate_and_num_bits_for_global_training(monkeypatch):
-    """sample_rate and num_bits should drive global training and worker build."""
+def test_create_index_passes_global_training_options_to_segment_build(monkeypatch):
+    """Global training options must reach driver training and segment builds."""
 
     captured = {}
     fake_dataset = _FakeDataset()
@@ -200,33 +200,18 @@ def test_create_index_uses_sample_rate_and_num_bits_for_global_training(monkeypa
             captured["train_pq"] = kwargs
             return SimpleNamespace(codebook="pq_codebook", num_subvectors=4)
 
-    def fake_handle_vector_fragment_index(**kwargs):
-        captured["fragment_handler_kwargs"] = kwargs
-        return lambda fragment_ids: {"status": "success", "fragment_ids": fragment_ids}
-
     def fake_put_vector_index_artifacts(ivf_centroids, pq_codebook):
         captured["put_artifacts"] = (ivf_centroids, pq_codebook)
         return "ivf_ref", "pq_ref"
 
     def fake_map_async_with_pool(**kwargs):
         captured["map_kwargs"] = kwargs
-        kwargs["create_fragment_handler"]()
-        return [
-            {
-                "status": "success",
-                "fragment_ids": [0, 1],
-                "segment_index": "segment",
-            }
-        ]
+        fragment_handler = kwargs["create_fragment_handler"]()
+        return [fragment_handler([0, 1])]
 
     monkeypatch.setattr(index_mod, "_check_pylance_version", lambda: None)
     monkeypatch.setattr(index_mod, "IndicesBuilder", FakeIndicesBuilder)
     monkeypatch.setattr(index_mod, "LanceDataset", lambda *args, **kwargs: fake_dataset)
-    monkeypatch.setattr(
-        index_mod,
-        "_handle_vector_fragment_index",
-        fake_handle_vector_fragment_index,
-    )
     monkeypatch.setattr(
         index_mod,
         "_put_vector_index_artifacts_in_object_store",
@@ -244,17 +229,21 @@ def test_create_index_uses_sample_rate_and_num_bits_for_global_training(monkeypa
         num_sub_vectors=4,
         num_bits=4,
         sample_rate=8,
+        max_iters=3,
     )
 
     assert updated_dataset is fake_dataset
     assert captured["train_ivf"]["sample_rate"] == 8
+    assert captured["train_ivf"]["max_iters"] == 3
     assert captured["train_pq"]["sample_rate"] == 8
     assert captured["train_pq"]["num_bits"] == 4
+    assert captured["train_pq"]["max_iters"] == 3
     assert captured["put_artifacts"] == ("ivf_centroids", "pq_codebook")
-    assert captured["fragment_handler_kwargs"]["ivf_centroids"] == "ivf_ref"
-    assert captured["fragment_handler_kwargs"]["pq_codebook"] == "pq_ref"
-    assert captured["fragment_handler_kwargs"]["num_bits"] == 4
-    assert "sample_rate" not in captured["fragment_handler_kwargs"]
+    assert fake_dataset.vector_index_kwargs["ivf_centroids"] == "ivf_ref"
+    assert fake_dataset.vector_index_kwargs["pq_codebook"] == "pq_ref"
+    assert fake_dataset.vector_index_kwargs["sample_rate"] == 8
+    assert fake_dataset.vector_index_kwargs["num_bits"] == 4
+    assert fake_dataset.vector_index_kwargs["max_iters"] == 3
     assert fake_dataset.commit_kwargs["segments"] == ["segment"]
 
 
