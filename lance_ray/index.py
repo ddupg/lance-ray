@@ -396,7 +396,7 @@ def merge_index_metadata_compat(dataset, index_id, index_type, **kwargs):
 
 
 def create_scalar_index(
-    uri: Optional[str] = None,
+    uri: Optional[Union[str, "lance.LanceDataset"]] = None,
     *,
     column: str,
     index_type: Literal["BTREE"]
@@ -424,8 +424,10 @@ def create_scalar_index(
     """Build scalar indices with Ray in a distributed workflow.
 
     Args:
-        uri: The URI of the Lance dataset to build index on. Either uri OR
-            (namespace_impl + table_id) must be provided.
+        uri: Lance dataset or URI to build index on. Either uri OR
+            (namespace_impl + table_id) must be provided. When passed a
+            ``LanceDataset``, its dataset URI is retained so distributed
+            workers and the final commit stay on the same Lance branch.
         column: Column name to index.
         index_type: Type of index to build ("BTREE", "BITMAP", "LABEL_LIST",
             "INVERTED", "FTS", "NGRAM", "ZONEMAP") or IndexConfig object.
@@ -480,8 +482,10 @@ def create_scalar_index(
     index_id = str(uuid.uuid4())
     logger.info("Starting distributed scalar index build with ID: %s", index_id)
 
-    # Validate uri or namespace params
-    validate_uri_or_namespace(uri, namespace_impl, table_id)
+    # Match the vector index entrypoint: URI / namespace mode is selected by
+    # the input value; every other value is treated as a dataset object.
+    if isinstance(uri, str | type(None)):
+        validate_uri_or_namespace(uri, namespace_impl, table_id)
 
     if not column:
         raise ValueError("Column name cannot be empty")
@@ -523,20 +527,27 @@ def create_scalar_index(
     # Note: Ray initialization is now handled by the Pool, following the pattern from io.py
     # This removes the need for explicit ray.init() calls
 
-    # Resolve URI and get storage options from namespace if provided
-    uri, merged_storage_options = resolve_namespace_table(
-        uri, storage_options, namespace_impl, namespace_properties, table_id
-    )
-
-    namespace_kwargs = get_namespace_kwargs(
-        namespace_impl, namespace_properties, table_id
-    )
-
-    # Load dataset
-    dataset = LanceDataset(
-        uri,
-        **_dataset_load_kwargs(merged_storage_options, namespace_kwargs, block_size),
-    )
+    if isinstance(uri, str | type(None)):
+        # Resolve URI and get storage options from namespace if provided.
+        dataset_uri, merged_storage_options = resolve_namespace_table(
+            uri, storage_options, namespace_impl, namespace_properties, table_id
+        )
+        namespace_kwargs = get_namespace_kwargs(
+            namespace_impl, namespace_properties, table_id
+        )
+        dataset = LanceDataset(
+            dataset_uri,
+            **_dataset_load_kwargs(
+                merged_storage_options, namespace_kwargs, block_size
+            ),
+        )
+    else:
+        dataset = uri
+        dataset_uri = dataset.uri
+        merged_storage_options = (
+            storage_options or getattr(dataset, "_storage_options", None) or {}
+        )
+        namespace_kwargs = {}
 
     try:
         resolved_column = resolve_dataset_field_path(dataset, column)
@@ -592,7 +603,7 @@ def create_scalar_index(
             # Implement replace semantics at the driver by dropping the index first.
             dataset.drop_index(name)
             dataset = LanceDataset(
-                uri,
+                dataset_uri,
                 **_dataset_load_kwargs(
                     merged_storage_options, namespace_kwargs, block_size
                 ),
@@ -630,7 +641,7 @@ def create_scalar_index(
     def create_fragment_handler() -> Any:
         if use_segment_workflow:
             return _handle_scalar_segment_index(
-                dataset_uri=uri,
+                dataset_uri=dataset_uri,
                 column=column,
                 index_type=index_type,
                 name=name,
@@ -644,7 +655,7 @@ def create_scalar_index(
             )
 
         return _handle_fragment_index(
-            dataset_uri=uri,
+            dataset_uri=dataset_uri,
             column=column,
             index_type=index_type,
             name=name,
@@ -680,7 +691,7 @@ def create_scalar_index(
 
     # Reload dataset to get the latest state after fragment index creation
     dataset = LanceDataset(
-        uri,
+        dataset_uri,
         **_dataset_load_kwargs(merged_storage_options, namespace_kwargs, block_size),
     )
 
@@ -736,7 +747,7 @@ def create_scalar_index(
     )
 
     updated_dataset = lance.LanceDataset.commit(
-        uri,
+        dataset_uri,
         create_index_op,
         read_version=dataset.version,
         storage_options=merged_storage_options,
