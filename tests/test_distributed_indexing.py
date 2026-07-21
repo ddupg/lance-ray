@@ -965,6 +965,35 @@ class TestDistributedBTreeIndexing:
         ).to_table()
         assert rg_tbl.num_rows > 0
 
+    def test_distributed_btree_index_on_branch(self, temp_dir):
+        """Build a distributed BTREE index on a branch without indexing main."""
+        main_dataset = generate_multi_fragment_dataset(
+            temp_dir, num_fragments=3, rows_per_fragment=500
+        )
+        branch_dataset = main_dataset.create_branch("distributed-btree-index")
+
+        indexed_branch = lr.create_scalar_index(
+            uri=branch_dataset,
+            column="id",
+            index_type="BTREE",
+            name="branch_btree_idx",
+            replace=False,
+            num_workers=3,
+        )
+
+        assert "branch_btree_idx" in {
+            index.name for index in indexed_branch.describe_indices()
+        }
+        assert "branch_btree_idx" not in {
+            index.name for index in lance.dataset(main_dataset.uri).describe_indices()
+        }
+
+        plan = indexed_branch.scanner(
+            filter="id = 100", columns=["id"], use_scalar_index=True
+        ).explain_plan()
+        assert "ScalarIndexQuery" in plan
+        assert "branch_btree_idx" in plan
+
     @pytest.fixture
     def btree_comp_datasets(self, tmp_path):
         """Build two datasets: one with a distributed BTREE index and one without index as baseline."""
