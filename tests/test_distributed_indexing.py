@@ -754,6 +754,44 @@ class TestDistributedIndexing:
             f"No results found for search term '{search_term}' after index replacement"
         )
 
+    def test_failed_replace_keeps_existing_index(
+        self, multi_fragment_lance_dataset, monkeypatch
+    ):
+        """A failed replacement must not remove the previously committed index."""
+        index_name = "test_replace_failure_keeps_existing_index"
+
+        lr.create_scalar_index(
+            uri=multi_fragment_lance_dataset,
+            column="text",
+            index_type="INVERTED",
+            name=index_name,
+            num_workers=2,
+        )
+
+        monkeypatch.setattr(
+            "lance_ray.index._map_async_with_pool",
+            lambda **_: [
+                {
+                    "status": "error",
+                    "fragment_ids": [0],
+                    "error": "injected worker failure",
+                }
+            ],
+        )
+
+        with pytest.raises(RuntimeError, match="injected worker failure"):
+            lr.create_scalar_index(
+                uri=multi_fragment_lance_dataset,
+                column="text",
+                index_type="INVERTED",
+                name=index_name,
+                replace=True,
+                num_workers=2,
+            )
+
+        indices = lance.dataset(multi_fragment_lance_dataset).describe_indices()
+        assert index_name in [index.name for index in indices]
+
     def test_build_distributed_index_auto_adjust_workers(self, temp_dir):
         """Test that num_workers is automatically adjusted if it exceeds fragment count."""
         # Create dataset with only 2 fragments
