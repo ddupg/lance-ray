@@ -1032,13 +1032,16 @@ def _train_pq_for_field_path(
     num_subvectors: Optional[int],
     sample_rate: int,
     num_bits: int,
+    max_iters: Optional[int],
 ) -> Any:
-    return builder.train_pq(
-        ivf_model,
-        num_subvectors=num_subvectors,
-        sample_rate=sample_rate,
-        num_bits=num_bits,
-    )
+    train_kwargs: dict[str, Any] = {
+        "num_subvectors": num_subvectors,
+        "sample_rate": sample_rate,
+        "num_bits": num_bits,
+    }
+    if max_iters is not None:
+        train_kwargs["max_iters"] = max_iters
+    return builder.train_pq(ivf_model, **train_kwargs)
 
 
 def _normalize_index_type(index_type: Any) -> str:
@@ -1122,6 +1125,7 @@ def _handle_vector_fragment_index(
     num_sub_vectors: Optional[int],
     ivf_centroids: pa.Array | pa.FixedSizeListArray | pa.FixedShapeTensorArray | None,
     pq_codebook: pa.Array | pa.FixedSizeListArray | pa.FixedShapeTensorArray | None,
+    sample_rate: int = 256,
     storage_options: Optional[dict[str, str]] = None,
     block_size: Optional[int] = None,
     namespace_impl: Optional[str] = None,
@@ -1171,6 +1175,7 @@ def _handle_vector_fragment_index(
                 ivf_centroids=resolved_ivf_centroids,
                 pq_codebook=resolved_pq_codebook,
                 num_sub_vectors=num_sub_vectors,
+                sample_rate=sample_rate,
                 storage_options=storage_options,
                 train=True,
                 fragment_ids=fragment_ids,
@@ -1353,6 +1358,7 @@ def create_index(
     ivf_centroids_artifact = ivf_centroids
     pq_codebook_artifact = pq_codebook
     index_build_kwargs = dict(kwargs)
+    max_iters = index_build_kwargs.get("max_iters")
     if rabitq_model is not None:
         index_build_kwargs["rabitq_model"] = rabitq_model
 
@@ -1381,11 +1387,14 @@ def create_index(
         dimension,
         sample_rate,
     )
-    ivf_model = builder.train_ivf(
-        num_partitions=requested_num_partitions,
-        distance_type=metric_lower,
-        sample_rate=sample_rate,
-    )
+    ivf_train_kwargs: dict[str, Any] = {
+        "num_partitions": requested_num_partitions,
+        "distance_type": metric_lower,
+        "sample_rate": sample_rate,
+    }
+    if max_iters is not None:
+        ivf_train_kwargs["max_iters"] = max_iters
+    ivf_model = builder.train_ivf(**ivf_train_kwargs)
     ivf_centroids_artifact = ivf_model.centroids
     num_partitions = ivf_model.num_partitions
     logger.info(
@@ -1409,6 +1418,7 @@ def create_index(
             num_subvectors=requested_num_sub_vectors,
             sample_rate=sample_rate,
             num_bits=pq_num_bits,
+            max_iters=max_iters,
         )
         pq_codebook_artifact = pq_model.codebook
         num_sub_vectors = pq_model.num_subvectors
@@ -1476,6 +1486,7 @@ def create_index(
             metric=metric_lower,
             num_partitions=num_partitions,
             num_sub_vectors=num_sub_vectors,
+            sample_rate=sample_rate,
             ivf_centroids=shared_ivf_centroids,
             pq_codebook=shared_pq_codebook,
             storage_options=merged_storage_options,
