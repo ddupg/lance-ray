@@ -1536,6 +1536,10 @@ def test_build_distributed_vector_index(tmp_path, index_type):
     dataset_uri = generate_multi_fragment_vector_dataset(
         tmp_path, num_fragments=4, rows_per_fragment=1024, dim=128
     )
+    build_kwargs = {"num_sub_vectors": 16, "sample_rate": 16}
+    if index_type == "IVF_PQ":
+        build_kwargs.update(num_bits=4, sample_rate=4)
+    index_name = f"idx_{index_type}"
 
     # Build distributed vector index using the high-level Ray entrypoint.
     try:
@@ -1543,12 +1547,11 @@ def test_build_distributed_vector_index(tmp_path, index_type):
             uri=dataset_uri,
             column="vector",
             index_type=index_type,
-            name=f"idx_{index_type}",
+            name=index_name,
             num_workers=2,
             num_segments=4,
             num_partitions=4,
-            num_sub_vectors=16,
-            sample_rate=16,
+            **build_kwargs,
         )
     except RuntimeError as exc:
         # Older pylance builds may not yet support creating empty distributed
@@ -1570,10 +1573,8 @@ def test_build_distributed_vector_index(tmp_path, index_type):
     assert len(indices) > 0, "No indices found after distributed vector index build"
 
     # Find the index with the name we specified
-    vec_index = next(
-        (idx for idx in indices if idx.name == f"idx_{index_type}"), None
-    )
-    assert vec_index is not None, f"Index with name idx_{index_type} not found"
+    vec_index = next((idx for idx in indices if idx.name == index_name), None)
+    assert vec_index is not None, f"Index with name {index_name} not found"
     assert vec_index.index_type == index_type, (
         f"Expected {index_type} vector index, got {vec_index.index_type}"
     )
@@ -1593,7 +1594,12 @@ def test_build_distributed_vector_index(tmp_path, index_type):
         columns=["id"],
     ).explain_plan()
     assert "ANNSubIndex" in plan
-    assert f"idx_{index_type}" in plan
+    assert index_name in plan
+
+    if index_type == "IVF_PQ":
+        stats = updated_dataset.stats.index_stats(index_name)
+        assert stats["indices"]
+        assert all(index["sub_index"]["nbits"] == 4 for index in stats["indices"])
 
 
 @pytest.mark.parametrize("index_type", ["IVF_FLAT", "IVF_PQ"])

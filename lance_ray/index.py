@@ -882,6 +882,7 @@ class _NestedVectorIndicesBuilder:
         *,
         sample_rate: int = 256,
         max_iters: int = 50,
+        num_bits: int = 8,
         fragment_ids: Optional[list[int]] = None,
     ) -> Any:
         from lance.indices.pq import PqModel
@@ -889,7 +890,7 @@ class _NestedVectorIndicesBuilder:
 
         num_rows = _count_rows_for_fragments(self.dataset, fragment_ids)
         num_subvectors = _normalize_pq_params(num_subvectors, self.dimension)
-        _verify_pq_sample_rate(num_rows, sample_rate)
+        _verify_pq_sample_rate(num_rows, sample_rate, num_bits)
         codebook = indices.train_pq_model(
             self.dataset._ds,
             self.column,
@@ -900,8 +901,9 @@ class _NestedVectorIndicesBuilder:
             max_iters,
             ivf_model.centroids,
             fragment_ids,
+            num_bits=num_bits,
         )
-        return PqModel(num_subvectors, codebook)
+        return PqModel(num_subvectors, codebook, num_bits=num_bits)
 
 
 def _count_rows_for_fragments(
@@ -990,13 +992,14 @@ def _normalize_pq_params(num_subvectors: Optional[int], dimension: int) -> int:
     return num_subvectors
 
 
-def _verify_pq_sample_rate(num_rows: int, sample_rate: int) -> None:
+def _verify_pq_sample_rate(num_rows: int, sample_rate: int, num_bits: int = 8) -> None:
     _verify_base_sample_rate(sample_rate)
-    if 256 * sample_rate > num_rows:
+    required_rows = (2**num_bits) * sample_rate
+    if required_rows > num_rows:
         raise ValueError(
             "There are not enough rows in the dataset to create PQ codebook with "
-            f"a sample rate of {sample_rate}. {sample_rate * 256} rows needed and "
-            f"there are {num_rows}"
+            f"a sample rate of {sample_rate} and num_bits of {num_bits}. "
+            f"{required_rows} rows needed and there are {num_rows}"
         )
 
 
@@ -1017,11 +1020,13 @@ def _train_pq_for_field_path(
     *,
     num_subvectors: Optional[int],
     sample_rate: int,
+    num_bits: int,
 ) -> Any:
     return builder.train_pq(
         ivf_model,
         num_subvectors=num_subvectors,
         sample_rate=sample_rate,
+        num_bits=num_bits,
     )
 
 
@@ -1237,6 +1242,7 @@ def create_index(
         metric: Distance metric to use (default: "l2")
         num_partitions: Number of IVF partitions (optional)
         num_sub_vectors: Number of PQ sub-vectors (optional)
+        num_bits: Number of bits used to encode each PQ centroid (default: 8)
         sample_rate: Number of rows sampled per IVF partition and PQ centroid (default: 256)
         ivf_centroids: Pre-computed IVF centroids (optional)
         pq_codebook: Pre-computed PQ codebook (optional)
@@ -1317,8 +1323,7 @@ def create_index(
 
     if not replace and _index_exists(dataset_obj, name):
         raise ValueError(
-            f"Index with name '{name}' already exists. Set replace=True "
-            "to replace it."
+            f"Index with name '{name}' already exists. Set replace=True to replace it."
         )
 
     fragments = dataset_obj.get_fragments()
@@ -1379,9 +1384,12 @@ def create_index(
 
     if needs_pq:
         requested_num_sub_vectors = num_sub_vectors
+        pq_num_bits = index_build_kwargs.get("num_bits", 8)
         logger.info(
-            "Training PQ codebook: requested_num_sub_vectors=%s, sample_rate=%d",
+            "Training PQ codebook: requested_num_sub_vectors=%s, "
+            "num_bits=%d, sample_rate=%d",
             requested_num_sub_vectors,
+            pq_num_bits,
             sample_rate,
         )
         pq_model = _train_pq_for_field_path(
@@ -1389,6 +1397,7 @@ def create_index(
             ivf_model,
             num_subvectors=requested_num_sub_vectors,
             sample_rate=sample_rate,
+            num_bits=pq_num_bits,
         )
         pq_codebook_artifact = pq_model.codebook
         num_sub_vectors = pq_model.num_subvectors

@@ -178,8 +178,8 @@ def test_map_async_with_pool_closes_and_joins_pool(monkeypatch):
     ]
 
 
-def test_create_index_uses_sample_rate_for_global_training(monkeypatch):
-    """The public sample_rate option should drive both IVF and PQ training."""
+def test_create_index_uses_sample_rate_and_num_bits_for_global_training(monkeypatch):
+    """sample_rate and num_bits should drive global training and worker build."""
 
     captured = {}
     fake_dataset = _FakeDataset()
@@ -242,15 +242,18 @@ def test_create_index_uses_sample_rate_for_global_training(monkeypatch):
         num_workers=2,
         num_partitions=4,
         num_sub_vectors=4,
+        num_bits=4,
         sample_rate=8,
     )
 
     assert updated_dataset is fake_dataset
     assert captured["train_ivf"]["sample_rate"] == 8
     assert captured["train_pq"]["sample_rate"] == 8
+    assert captured["train_pq"]["num_bits"] == 4
     assert captured["put_artifacts"] == ("ivf_centroids", "pq_codebook")
     assert captured["fragment_handler_kwargs"]["ivf_centroids"] == "ivf_ref"
     assert captured["fragment_handler_kwargs"]["pq_codebook"] == "pq_ref"
+    assert captured["fragment_handler_kwargs"]["num_bits"] == 4
     assert "sample_rate" not in captured["fragment_handler_kwargs"]
     assert fake_dataset.commit_kwargs["segments"] == ["segment"]
 
