@@ -231,6 +231,7 @@ def _handle_scalar_segment_index(
     column: str,
     index_type: str | IndexConfig,
     name: str,
+    replace: bool,
     train: bool,
     storage_options: Optional[dict[str, str]] = None,
     block_size: Optional[int] = None,
@@ -273,7 +274,7 @@ def _handle_scalar_segment_index(
                 column=column,
                 index_type=index_type,
                 name=name,
-                replace=False,
+                replace=replace,
                 train=train,
                 storage_options=storage_options,
                 fragment_ids=fragment_ids,
@@ -610,23 +611,21 @@ def create_scalar_index(
     if name is None:
         name = f"{column}_idx"
 
-    if replace:
-        if _index_exists(dataset, name):
+    if _index_exists(dataset, name):
+        if not replace:
+            raise ValueError(
+                f"Index with name '{name}' already exists. Set replace=True "
+                "to replace it."
+            )
+        if not use_segment_workflow:
             # Lance 4.0.0: fragment_ids + replace=True may hit an unimplemented path.
-            # Implement replace semantics at the driver by dropping the index first.
+            # Keep the existing driver-side replacement behavior for the legacy workflow.
             dataset.drop_index(name)
             dataset = LanceDataset(
                 dataset_uri,
                 **_dataset_load_kwargs(
                     merged_storage_options, namespace_kwargs, block_size
                 ),
-            )
-
-    else:
-        if _index_exists(dataset, name):
-            raise ValueError(
-                f"Index with name '{name}' already exists. Set replace=True "
-                "to replace it."
             )
 
     fragments = dataset.get_fragments()
@@ -672,6 +671,7 @@ def create_scalar_index(
                 column=column,
                 index_type=index_type,
                 name=name,
+                replace=replace,
                 train=train,
                 storage_options=merged_storage_options,
                 block_size=block_size,
