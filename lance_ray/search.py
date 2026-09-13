@@ -348,6 +348,11 @@ def _execute_flat_fallback_vector_search_plan(
         _get_nearest_metric(nearest),
     )
     table = table.append_column("_distance", pa.array(distances, type=pa.float32()))
+    # Skip filtering when there are no NaNs to avoid copying the table.
+    invalid = pc.is_nan(table["_distance"])
+    if pc.any(invalid).as_py():
+        # Like Lance, exclude NaN before top-k, but preserve infinite distances.
+        table = table.filter(pc.invert(invalid))
     table = _take_top_k(table, candidate_k)
     if drop_vector_column and vector_scan_column in table.column_names:
         table = table.drop_columns([vector_scan_column])
@@ -441,7 +446,7 @@ def _compute_vector_distances(
         similarities = np.divide(
             matrix @ query_vector,
             denom,
-            out=np.zeros(matrix.shape[0], dtype=np.float32),
+            out=np.full(matrix.shape[0], np.nan, dtype=np.float32),
             where=denom != 0,
         )
         return (1.0 - similarities).astype(np.float32)

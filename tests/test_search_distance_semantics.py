@@ -163,6 +163,87 @@ def test_unindexed_search_matches_lance(
     )
 
 
+@pytest.mark.parametrize(
+    "query, k", [([1.0, 0.0], 1), ([1.0, 0.0], 3), ([0.0, 0.0], 3)]
+)
+def test_zero_norm_cosine_search_matches_lance(
+    tmp_path: Path, search_pool: None, query: list[float], k: int
+) -> None:
+    uri = tmp_path / "zero_norm.lance"
+    lance.write_dataset(_table([0, 1], [[0.0, 0.0], [-1.0, 0.0]]), uri)
+    dataset = lance.write_dataset(_table([2], [[0.0, 1.0]]), uri, mode="append")
+    nearest = {
+        "column": "vector",
+        "q": query,
+        "k": k,
+        "metric": "cosine",
+        "use_index": False,
+    }
+    expected = dataset.to_table(columns=["id", "_distance"], nearest=nearest)
+
+    actual = vector_search(dataset, nearest=nearest, columns=["id"], num_workers=2)
+
+    assert isinstance(actual, pa.Table)
+    assert actual.schema == expected.schema
+    assert actual["id"].to_pylist() == expected["id"].to_pylist()
+    assert actual["_distance"].to_pylist() == pytest.approx(
+        expected["_distance"].to_pylist()
+    )
+    # Zero vectors must not displace valid candidates or fill a short result.
+    assert actual.num_rows == (min(k, 2) if any(query) else 0)
+    assert 0 not in actual["id"].to_pylist()
+
+
+@pytest.mark.parametrize(
+    "metric, nan_query",
+    [("cosine", False), ("l2", True), ("dot", True), ("cosine", True)],
+)
+def test_nan_distance_search_matches_lance(
+    tmp_path: Path, search_pool: None, metric: str, nan_query: bool
+) -> None:
+    uri = tmp_path / "nan.lance"
+    lance.write_dataset(_table([0], [[float("nan"), 0.0]]), uri)
+    dataset = lance.write_dataset(_table([1], [[1.0, 0.0]]), uri, mode="append")
+    nearest = {
+        "column": "vector",
+        "q": [float("nan") if nan_query else 1.0, 0.0],
+        "k": 2,
+        "metric": metric,
+        "use_index": False,
+    }
+    expected = dataset.to_table(columns=["id", "_distance"], nearest=nearest)
+    actual = vector_search(dataset, nearest=nearest, columns=["id"], num_workers=2)
+
+    assert isinstance(actual, pa.Table)
+    assert actual.equals(expected)
+    assert actual["id"].to_pylist() == ([] if nan_query else [1])
+
+
+@pytest.mark.parametrize("metric", ["l2", "dot"])
+def test_infinite_distance_search_matches_lance(
+    tmp_path: Path, search_pool: None, metric: str
+) -> None:
+    dataset = lance.write_dataset(
+        _table([0, 1, 2], [[float("inf"), 0.0], [1.0, 0.0], [float("nan"), 0.0]]),
+        tmp_path / "infinite.lance",
+    )
+    nearest = {
+        "column": "vector",
+        "q": [1.0, 0.0],
+        "k": 3,
+        "metric": metric,
+        "use_index": False,
+    }
+    expected = dataset.to_table(columns=["id", "_distance"], nearest=nearest)
+    actual = vector_search(dataset, nearest=nearest, columns=["id"], num_workers=2)
+
+    assert isinstance(actual, pa.Table)
+    assert actual.equals(expected)
+    assert actual.num_rows == 2
+    expected_inf = float("inf") if metric == "l2" else float("-inf")
+    assert expected_inf in actual["_distance"].to_pylist()
+
+
 @pytest.mark.parametrize("as_dict", [True, False])
 def test_get_index_metric_uses_manifest_details(as_dict: bool) -> None:
     # No stats API: reading manifest metadata must not open index files.
