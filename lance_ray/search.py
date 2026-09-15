@@ -3,13 +3,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import math
 import pickle
-from collections import deque
-from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+import queue
+import threading
+from collections.abc import Coroutine, Generator, Iterable
+from concurrent.futures import Future
+from contextlib import suppress
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Optional, cast
 
@@ -658,7 +662,8 @@ def vector_search(
     ``index_segments``.  Unindexed fallback tasks scan their assigned fragments
     without ``nearest`` and compute distances locally.  Workers return local
     candidates and the driver sorts by ``_distance`` to produce the final top-k
-    table.
+    table. Each call creates and closes its own actors; use
+    ``open_vector_search()`` to reuse actors and caches across requests.
 
     Args:
         uri: Lance dataset object or dataset URI.  In URI mode, provide either
@@ -672,7 +677,8 @@ def vector_search(
             dot distances are ``1 - dot(q, v)``, matching Lance.
         index_name: Optional vector index name to use.  If specified and the
             index cannot be found, ``ValueError`` is raised.  If omitted,
-            Lance-Ray uses the first vector index covering ``nearest["column"]``.
+            Lance-Ray uses the first vector index covering ``nearest["column"]``
+            with a compatible metric.
         columns: Projection passed to the Lance scanner.  When a list is
             provided, ``_distance`` is appended automatically because the driver
             needs it to merge global top-k results.
@@ -706,10 +712,51 @@ def vector_search(
             supplied here.
 
     Returns:
-        A PyArrow table containing the global top-k rows sorted by ``_distance``.
+        A PyArrow table containing the global top-k rows for each query.
+        Single-query results are sorted by ``_distance``. Batch results include
+        ``query_index`` and are sorted by query index, distance, and row ID.
         If ``analyze_plan=True``, returns a string containing per-shard Lance
         scanner analysis instead.
     """
+    if not analyze_plan:
+        request_nearest = dict(nearest)
+        try:
+            column = request_nearest.pop("column")
+            query = request_nearest.pop("q")
+        except KeyError as exc:
+            raise ValueError("nearest must include 'column', 'q' and 'k'") from exc
+        metric = request_nearest.pop("metric", None) or request_nearest.pop(
+            "distance_type", None
+        )
+        request_nearest.pop("distance_type", None)
+        with open_vector_search(
+            uri,
+            column=column,
+            metric=metric,
+            index_name=index_name,
+            storage_options=storage_options,
+            block_size=block_size,
+            namespace_impl=namespace_impl,
+            namespace_properties=namespace_properties,
+            table_id=table_id,
+            max_concurrent_requests=1,
+            actor_options=VectorSearchActorOptions(
+                num_actors=num_workers,
+                ray_remote_args=ray_remote_args,
+            ),
+        ) as session:
+            indexed_only = fast_search or not include_unindexed
+            result, _ = session._submit_search(
+                query,
+                nearest=request_nearest,
+                columns=columns,
+                filter=filter,
+                fast_search=indexed_only,
+                scanner_options=scanner_options,
+                oversample_factor=oversample_factor,
+            ).result()
+            return cast(pa.Table, result)
+
     if num_workers <= 0:
         raise ValueError(f"num_workers must be positive, got {num_workers}")
     if block_size is not None and block_size <= 0:
@@ -719,7 +766,7 @@ def vector_search(
     if not column:
         raise ValueError("nearest must include 'column' for distributed vector search")
 
-    global_k, candidate_k = _candidate_k(nearest, oversample_factor)
+    _, candidate_k = _candidate_k(nearest, oversample_factor)
 
     base_scanner_options = dict(scanner_options or {})
     _validate_search_scanner_options(base_scanner_options)
@@ -790,17 +837,6 @@ def vector_search(
     if not plans:
         return pa.table({})
 
-    if (
-        not analyze_plan
-        and vector_index is not None
-        and not (nearest.get("metric") or nearest.get("distance_type"))
-        and any(not plan.index_segments for plan in plans)
-    ):
-        # Lance infers the index metric for ANN queries. Use the same metric
-        # on flat shards before comparing their distances in the global merge.
-        # Plan analysis returns before computing fallback distances.
-        nearest = {**nearest, "metric": _get_index_metric(dataset, vector_index)}
-
     pickled_dataset = pickle.dumps(dataset)
 
     try:
@@ -828,10 +864,7 @@ def vector_search(
             f"Failed to complete distributed vector search: {exc}"
         ) from exc
 
-    if analyze_plan:
-        return _format_analyze_plan_results(results)
-
-    return _merge_vector_search_results(results, global_k)
+    return _format_analyze_plan_results(results)
 
 
 def _resolve_vector_search_schema(
@@ -919,20 +952,6 @@ def _take_top_k_per_query(table: pa.Table, k: int) -> pa.Table:
 
 
 @dataclass(frozen=True)
-class VectorSearchStreamingOptions:
-    """Controls query batching and the bounded driver pipeline."""
-
-    query_batch_size: Optional[int] = None
-    max_in_flight_batches: int = 1
-
-    def __post_init__(self) -> None:
-        if self.query_batch_size is not None and self.query_batch_size <= 0:
-            raise ValueError("query_batch_size must be positive")
-        if self.max_in_flight_batches <= 0:
-            raise ValueError("max_in_flight_batches must be positive")
-
-
-@dataclass(frozen=True)
 class VectorSearchActorOptions:
     """Controls Ray actors, their Lance sessions, and scanner execution."""
 
@@ -971,6 +990,7 @@ class _DatasetSnapshot:
 class _ActorPlan:
     index_segments: tuple[str, ...]
     fallback_fragment_ids: tuple[int, ...]
+    flat_fragment_ids: tuple[int, ...]
 
 
 def _plan_streaming_vector_search(
@@ -978,12 +998,11 @@ def _plan_streaming_vector_search(
     fragments: list[Any],
     vector_index: Any | None,
     num_actors: int,
-    fast_search: bool,
 ) -> list[_ActorPlan]:
     indexed_units, fallback_units, _, _ = _build_vector_search_plan_units(
         fragments=fragments,
         vector_index=vector_index,
-        include_unindexed=not fast_search,
+        include_unindexed=True,
     )
     units = [*indexed_units, *fallback_units]
 
@@ -1003,10 +1022,20 @@ def _plan_streaming_vector_search(
             index_segments[actor_idx].extend(unit.index_segments)
         actor_weights[actor_idx] += unit.weight
 
+    # Flat ownership covers the full snapshot independently of ANN ownership.
+    # Segment coverage can overlap: assign each fragment exactly once.
+    flat_fragments: list[list[int]] = [[] for _ in range(actor_count)]
+    flat_weights = [0] * actor_count
+    for fragment in sorted(fragments, key=lambda item: item.count_rows(), reverse=True):
+        idx = min(range(actor_count), key=lambda item: flat_weights[item])
+        flat_fragments[idx].append(_get_fragment_id(fragment))
+        flat_weights[idx] += fragment.count_rows()
+
     return [
         _ActorPlan(
             index_segments=tuple(index_segments[idx]),
             fallback_fragment_ids=tuple(sorted(fallback_fragments[idx])),
+            flat_fragment_ids=tuple(sorted(flat_fragments[idx])),
         )
         for idx in range(actor_count)
     ]
@@ -1183,6 +1212,7 @@ def _indexed_search(
         nearest=search_nearest,
         index_segments=index_segments,
         fast_search=True,
+        prefilter=True,
     )
     return dataset.scanner(**scanner_options).to_table()
 
@@ -1224,6 +1254,13 @@ def _search_vector_shard(
                 candidate_k=candidate_k,
             )
         )
+    if not per_query:
+        tables = [
+            table.drop_columns(["query_index"])
+            if "query_index" in table.column_names
+            else table
+            for table in tables
+        ]
     return _merge_vector_search_results(
         tables,
         candidate_k,
@@ -1317,6 +1354,10 @@ def _canonical_multivector_batch(
 
     if array is not None and array.ndim <= 3:
         if array.size == 0:
+            if array.ndim == 2 or (array.ndim == 3 and array.shape[0] > 0):
+                raise ValueError(
+                    "Each multivector query must contain at least one vector"
+                )
             return ()
         if array.ndim == 1:
             return (np.array(array.reshape(1, -1), copy=True, order="C"),)
@@ -1360,7 +1401,7 @@ def _multivector_fallback_search(
     # Core requires prefilter for nearest scans scoped to explicit fragments.
     scanner_options["prefilter"] = True
 
-    search_nearest = {**nearest, "k": candidate_k}
+    search_nearest = {**nearest, "k": candidate_k, "use_index": False}
     distance_range = search_nearest.pop("distance_range", None)
     scanner_options["nearest"] = search_nearest
     table = dataset.scanner(**scanner_options).to_table()
@@ -1392,7 +1433,6 @@ class _VectorSearchActor:
         self,
         snapshot: _DatasetSnapshot,
         plan: _ActorPlan,
-        base_scanner_options: dict[str, Any],
         index_name: Optional[str],
         is_multivector: bool,
         actor_options: VectorSearchActorOptions,
@@ -1403,7 +1443,6 @@ class _VectorSearchActor:
             metadata_cache_size_bytes=actor_options.metadata_cache_size_bytes,
         )
         self._plan = plan
-        self._base_scanner_options = base_scanner_options
         self._index_name = index_name
         self._is_multivector = is_multivector
 
@@ -1435,32 +1474,51 @@ class _VectorSearchActor:
         query_batch: Any,
         nearest: dict[str, Any],
         candidate_k: int,
+        scanner_options: dict[str, Any],
+        fast_search: bool,
     ) -> pa.Table:
         metric = _get_nearest_metric(nearest)
         if self._is_multivector:
             queries = _canonical_multivector_batch(query_batch, metric)
         else:
             queries = _canonical_query_batch(query_batch, metric, copy=False)
-        return self._search_micro_batch(queries, nearest, candidate_k)
+        return self._search_micro_batch(
+            queries, nearest, candidate_k, scanner_options, fast_search
+        )
 
     def _search_micro_batch(
         self,
         query_batch: Any,
         nearest: dict[str, Any],
         candidate_k: int,
+        scanner_options: dict[str, Any],
+        fast_search: bool,
     ) -> pa.Table:
-        if self._is_multivector:
+        use_index = nearest.get("use_index", True)
+        index_segments = self._plan.index_segments if use_index else ()
+        fragments = (
+            self._plan.fallback_fragment_ids
+            if use_index
+            else self._plan.flat_fragment_ids
+        )
+        if fast_search:
+            fragments = ()
+        if not index_segments and not fragments:
+            return pa.table({})
+        # PyLance's 2-D query conversion uses float32. Keep packed Hamming
+        # vectors uint8 by issuing native single-query searches inside the actor.
+        if self._is_multivector or _get_nearest_metric(nearest) == "hamming":
             results = [
                 _add_query_index(
                     _search_vector_shard(
                         self._dataset,
-                        index_segments=self._plan.index_segments,
-                        fallback_fragment_ids=self._plan.fallback_fragment_ids,
-                        base_scanner_options=self._base_scanner_options,
+                        index_segments=index_segments,
+                        fallback_fragment_ids=fragments,
+                        base_scanner_options=scanner_options,
                         nearest={**nearest, "q": query},
                         candidate_k=candidate_k,
                         per_query=False,
-                        is_multivector=True,
+                        is_multivector=self._is_multivector,
                     ),
                     query_index,
                 )
@@ -1470,17 +1528,39 @@ class _VectorSearchActor:
 
         return _search_vector_shard(
             self._dataset,
-            index_segments=self._plan.index_segments,
-            fallback_fragment_ids=self._plan.fallback_fragment_ids,
-            base_scanner_options=self._base_scanner_options,
+            index_segments=index_segments,
+            fallback_fragment_ids=fragments,
+            base_scanner_options=scanner_options,
             nearest={**nearest, "q": query_batch},
             candidate_k=candidate_k,
             per_query=True,
         )
 
 
+@dataclass(frozen=True)
+class _SearchRequest:
+    nearest: dict[str, Any]
+    scanner_options: dict[str, Any]
+    k: int
+    candidate_k: int
+    include_row_id: bool
+    fast_search: bool
+
+
+@dataclass(eq=False)
+class _RequestSlot:
+    task: Optional[asyncio.Task[Any]] = None
+    input_consumed: threading.Event = field(default_factory=threading.Event)
+    abandoned: bool = False
+    released: bool = False
+
+
 class VectorSearchSession:
-    """A snapshot-pinned, actor-backed streaming vector search session."""
+    """A snapshot-pinned, actor-backed vector search session."""
+
+    # Scheduling granularity, not a public memory budget. Never split one
+    # multivector query into separate queries.
+    _QUERY_CHUNK_SIZE = 128
 
     def __init__(
         self,
@@ -1488,56 +1568,74 @@ class VectorSearchSession:
         dataset: LanceDataset,
         vector_type: pa.DataType,
         snapshot: _DatasetSnapshot,
-        nearest: dict[str, Any],
+        column: str,
+        metric: str,
         index_name: Optional[str],
         plans: list[_ActorPlan],
-        base_scanner_options: dict[str, Any],
-        include_row_id: bool,
-        global_k: int,
-        candidate_k: int,
-        streaming_options: VectorSearchStreamingOptions,
+        max_concurrent_requests: int,
         actor_options: VectorSearchActorOptions,
     ):
         self._dataset = dataset
         self.vector_type = vector_type
+        self._column = column
+        self._metric = metric
+        self._version = snapshot.version
         self._is_multivector = _streaming_is_multivector_type(vector_type)
-        self._nearest = nearest
-        self._base_scanner_options = base_scanner_options
-        self._include_row_id = include_row_id
-        self._global_k = global_k
-        self._candidate_k = candidate_k
-        self._streaming_options = streaming_options
-        self._result_schema: Optional[pa.Schema] = None
-        self._closed = False
+        self._max_concurrent_requests = max_concurrent_requests
+        self._slots: set[_RequestSlot] = set()
+        self._capacity = asyncio.Condition()
+        self._closing = threading.Event()
+        self._closed = threading.Event()
+        self._close_lock = threading.Lock()
+        self._failure: Optional[BaseException] = None
         self.actor_states: list[dict[str, Any]] = []
         self.prewarm_results: list[dict[str, Any]] = []
+        self._actors: list[Any] = []
 
         remote_args = dict(actor_options.ray_remote_args or {})
         remote_args.setdefault("num_cpus", 1)
         actor_class = cast(Any, _VectorSearchActor).options(**remote_args)
-        self._actors = [
-            actor_class.remote(
-                snapshot,
-                plan,
-                base_scanner_options,
-                index_name,
-                self._is_multivector,
-                actor_options,
-            )
-            for plan in plans
-        ]
         try:
+            for plan in plans:
+                self._actors.append(
+                    actor_class.remote(
+                        snapshot, plan, index_name, self._is_multivector, actor_options
+                    )
+                )
             if self._actors:
                 self.actor_states = ray.get(
                     [actor.ready.remote() for actor in self._actors]
                 )
-            if actor_options.prewarm_index and self._actors:
-                self.prewarm_results = ray.get(
-                    [actor.prewarm.remote() for actor in self._actors]
-                )
-        except Exception:
-            self.close()
+                if actor_options.prewarm_index:
+                    self.prewarm_results = ray.get(
+                        [actor.prewarm.remote() for actor in self._actors]
+                    )
+        except BaseException:
+            for actor in self._actors:
+                ray.kill(actor, no_restart=True)
             raise
+
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._run_loop, name="lance-ray-search", daemon=True
+        )
+        self._thread.start()
+
+    @property
+    def column(self) -> str:
+        return self._column
+
+    @property
+    def metric(self) -> str:
+        return self._metric
+
+    @property
+    def version(self) -> int:
+        return self._version
+
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
 
     def __enter__(self) -> VectorSearchSession:
         return self
@@ -1545,161 +1643,527 @@ class VectorSearchSession:
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         self.close()
 
-    def close(self) -> None:
-        if self._closed:
+    async def __aenter__(self) -> VectorSearchSession:
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        await self.aclose()
+
+    def _schedule(self, coroutine: Coroutine[Any, Any, Any]) -> Future[Any]:
+        # The lock also prevents submitting a coroutine to a stopped loop.
+        with self._close_lock:
+            if self._closing.is_set():
+                coroutine.close()
+                raise RuntimeError("VectorSearchSession is closing or closed")
+            return asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+
+    async def _acquire(self, stop: Optional[threading.Event] = None) -> _RequestSlot:
+        async with self._capacity:
+            while True:
+                if stop is not None and stop.is_set():
+                    raise asyncio.CancelledError
+                if self._closing.is_set():
+                    raise RuntimeError("VectorSearchSession is closing or closed")
+                if self._failure is not None:
+                    raise RuntimeError(
+                        "A search actor died; close and reopen VectorSearchSession"
+                    ) from self._failure
+                if len(self._slots) < self._max_concurrent_requests:
+                    slot = _RequestSlot()
+                    self._slots.add(slot)
+                    return slot
+                await self._capacity.wait()
+
+    async def _release(self, slot: _RequestSlot) -> None:
+        async with self._capacity:
+            slot.released = True
+            slot.input_consumed.set()
+            self._slots.discard(slot)
+            self._capacity.notify_all()
+
+    async def _abandon(self, slot: _RequestSlot) -> None:
+        if slot.abandoned:
             return
-        self._closed = True
-        for actor in self._actors:
-            ray.kill(actor, no_restart=True)
-        self._actors.clear()
+        slot.abandoned = True
+        if slot.task is not None and not slot.task.done():
+            slot.task.cancel()
+        else:
+            await self._release(slot)
 
-    def map_batches(self, query_batches: Iterable[Any]) -> Iterator[pa.Table]:
-        """Search an iterable of query batches with bounded memory.
+    def _cleanup_slot(self, slot: _RequestSlot, *, abandon: bool = False) -> None:
+        with self._close_lock:
+            if self._closing.is_set():
+                return  # close() already owns draining and releasing these slots.
+            operation = self._abandon(slot) if abandon else self._release(slot)
+            future = asyncio.run_coroutine_threadsafe(operation, self._loop)
+        future.result()
 
-        The driver canonicalizes each input batch, places it in Ray's object
-        store once, broadcasts the resulting reference to all search actors,
-        merges their local candidates per query, and yields the completed
-        global top-k table. At most
-        ``streaming_options.max_in_flight_batches`` batches are retained.
+    async def _blocking(self, function: Any, *args: Any) -> Any:
+        task = asyncio.create_task(asyncio.to_thread(function, *args))
+        cancelled = False
+        while True:
+            try:
+                result = await asyncio.shield(task)
+                break
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    raise
+                # Repeated cancellation must not detach running native work.
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
+    async def _actor_results(self, refs: list[Any]) -> list[pa.Table]:
+        pending = asyncio.gather(
+            *(asyncio.wrap_future(ref.future()) for ref in refs),
+            return_exceptions=True,
+        )
+        cancelled = False
+        while True:
+            try:
+                results = await asyncio.shield(pending)
+                break
+            except asyncio.CancelledError:
+                if pending.cancelled():
+                    raise
+                if not cancelled:
+                    for ref in refs:
+                        # A synchronous actor may already be running native code.
+                        with suppress(Exception):
+                            ray.cancel(ref, force=False)
+                cancelled = True
+        for result in results:
+            if isinstance(result, ray.exceptions.ActorDiedError):
+                async with self._capacity:
+                    self._failure = result
+                    self._capacity.notify_all()
+        if cancelled:
+            raise asyncio.CancelledError
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        return cast(list[pa.Table], results)
+
+    def _prepare(
+        self, query: Any, nearest: dict[str, Any], options: dict[str, Any], batch: bool
+    ) -> tuple[Any, pa.Schema, bool]:
+        import numpy as np
+
+        is_batch = batch or _is_batch_query(query, self._is_multivector)
+        queries: Any = (
+            _canonical_multivector_batch(query, self.metric)
+            if self._is_multivector
+            else _canonical_query_batch(query, self.metric)
+        )
+        vector_type: Any = self.vector_type
+        if self._is_multivector:
+            vector_type = vector_type.value_type
+        dimension = vector_type.list_size
+        if not is_batch and len(queries) == 0:
+            raise ValueError("A single query must not be empty")
+        if self._is_multivector:
+            for item in queries:
+                if len(item) == 0 or item.shape[1] != dimension:
+                    raise ValueError(
+                        "Each multivector query must have shape [M, D], M > 0"
+                    )
+        elif len(queries) and queries.shape[1] != dimension:
+            raise ValueError(f"Query vector dimension must be {dimension}")
+
+        dtype = np.uint8 if self.metric == "hamming" else np.float32
+        # Schema depends on the projection and column, not the query count.
+        # Avoid converting an entire large batch just to discover its schema.
+        schema_query = (
+            queries[0]
+            if len(queries)
+            else np.ones(
+                (1, dimension) if self._is_multivector else (dimension,), dtype=dtype
+            )
+        )
+        schema = _resolve_vector_search_schema(
+            self._dataset,
+            nearest={**nearest, "q": schema_query},
+            base_scanner_options=options,
+            include_row_id=True,
+        )
+        fields = [field for field in schema if field.name != "query_index"]
+        schema = pa.schema(
+            [pa.field("query_index", pa.int64(), nullable=False), *fields]
+        )
+        return queries, schema, is_batch
+
+    def _request_options(
+        self,
+        nearest: dict[str, Any],
+        columns: Optional[list[str] | dict[str, str]],
+        filter: Optional[Any],
+        fast_search: bool,
+        scanner_options: Optional[dict[str, Any]],
+        oversample_factor: float = 1.0,
+    ) -> _SearchRequest:
+        conflicts = {"q", "column", "metric", "distance_type"} & nearest.keys()
+        if conflicts:
+            raise ValueError(
+                "Query input and instance options cannot be supplied in nearest: "
+                + ", ".join(sorted(conflicts))
+            )
+        nearest = dict(nearest)
+        global_k, candidate_k = _candidate_k(nearest, oversample_factor)
+        if fast_search and not nearest.get("use_index", True):
+            raise ValueError("use_index=False cannot be combined with fast_search=True")
+        options = dict(scanner_options or {})
+        _validate_search_scanner_options(options)
+        if options.get("prefilter", True) is not True:
+            raise ValueError("Distributed vector search only supports prefilter=True")
+        include_row_id = _projection_includes_row_id(columns, options)
+        columns = columns if columns is not None else options.get("columns")
+        if columns is not None:
+            if "query_index" in columns:
+                raise ValueError("query_index is managed by batch vector search")
+            columns = columns.copy()
+            if isinstance(columns, list) and "_distance" not in columns:
+                columns.append("_distance")
+            options["columns"] = columns
+        if filter is not None:
+            options["filter"] = filter
+        options.update(prefilter=True, with_row_id=True)
+        nearest.update(column=self.column, metric=self.metric)
+        return _SearchRequest(
+            nearest=nearest,
+            scanner_options=options,
+            k=global_k,
+            candidate_k=candidate_k,
+            include_row_id=include_row_id,
+            fast_search=fast_search,
+        )
+
+    def _submit_search(
+        self,
+        query: Any,
+        *,
+        nearest: dict[str, Any],
+        columns: Optional[list[str] | dict[str, str]],
+        filter: Optional[Any],
+        fast_search: bool,
+        scanner_options: Optional[dict[str, Any]],
+        oversample_factor: float = 1.0,
+    ) -> Future[Any]:
+        request = self._request_options(
+            nearest, columns, filter, fast_search, scanner_options, oversample_factor
+        )
+        return self._schedule(self._execute(query, request))
+
+    async def _execute(
+        self,
+        query: Any,
+        request: _SearchRequest,
+        *,
+        batch: bool = False,
+        slot: Optional[_RequestSlot] = None,
+    ) -> tuple[pa.Table, int]:
+        hold_for_delivery = slot is not None
+        slot = slot if slot is not None else await self._acquire()
+        if slot.released:
+            raise RuntimeError("Search request was cancelled before execution")
+        slot.task = asyncio.current_task()
+        try:
+            if self._failure is not None:
+                raise RuntimeError(
+                    "A search actor died; reopen the session"
+                ) from self._failure
+            try:
+                queries, schema, is_batch = await self._blocking(
+                    self._prepare,
+                    query,
+                    request.nearest,
+                    request.scanner_options,
+                    batch,
+                )
+            finally:
+                # The source may reuse its buffer when next() is called again.
+                slot.input_consumed.set()
+            pieces = []
+            for offset in range(0, len(queries), self._QUERY_CHUNK_SIZE):
+                if self._failure is not None:
+                    raise RuntimeError(
+                        "A search actor died; reopen the session"
+                    ) from self._failure
+                query_ref = ray.put(queries[offset : offset + self._QUERY_CHUNK_SIZE])
+                refs = []
+                try:
+                    for actor in self._actors:
+                        refs.append(
+                            actor.search.remote(
+                                query_ref,
+                                request.nearest,
+                                request.candidate_k,
+                                request.scanner_options,
+                                request.fast_search,
+                            )
+                        )
+                except BaseException:
+                    # Retain admission until already submitted work is drained.
+                    await self._actor_results(refs)
+                    raise
+                tables = await self._actor_results(refs)
+                piece = await self._blocking(
+                    self._merge_chunk, tables, request.k, schema, offset
+                )
+                pieces.append(piece)
+                # Each request submits at most one fan-out at a time.
+                await asyncio.sleep(0)
+            result = await self._blocking(
+                self._assemble, pieces, schema, is_batch, request.include_row_id
+            )
+            return result, len(queries)
+        finally:
+            slot.input_consumed.set()
+            # Both results and errors retain streaming capacity until delivery.
+            if not hold_for_delivery or slot.abandoned:
+                await self._release(slot)
+
+    @staticmethod
+    def _merge_chunk(
+        tables: list[pa.Table], k: int, schema: pa.Schema, offset: int
+    ) -> pa.Table:
+        result = _merge_vector_search_results(tables, k, per_query=True)
+        if not result.num_rows:
+            return pa.Table.from_batches([], schema=schema)
+        result = _offset_query_index(result, offset, output_type=pa.int64())
+        return result.select(schema.names)
+
+    @staticmethod
+    def _assemble(
+        pieces: list[pa.Table], schema: pa.Schema, batch: bool, include_row_id: bool
+    ) -> pa.Table:
+        result = (
+            pa.concat_tables(pieces, promote_options="default")
+            if pieces
+            else pa.Table.from_batches([], schema=schema)
+        )
+        if not batch:
+            result = result.drop_columns(["query_index"])
+        if not include_row_id and "_rowid" in result.column_names:
+            result = result.drop_columns(["_rowid"])
+        return result
+
+    def search(
+        self,
+        query: Any,
+        *,
+        nearest: dict[str, Any],
+        columns: Optional[list[str] | dict[str, str]] = None,
+        filter: Optional[Any] = None,
+        fast_search: bool = False,
+        scanner_options: Optional[dict[str, Any]] = None,
+    ) -> pa.Table:
+        """Search one query or finite batch, blocking until its complete result."""
+        result, _ = self._submit_search(
+            query,
+            nearest=nearest,
+            columns=columns,
+            filter=filter,
+            fast_search=fast_search,
+            scanner_options=scanner_options,
+        ).result()
+        return cast(pa.Table, result)
+
+    async def search_async(
+        self,
+        query: Any,
+        *,
+        nearest: dict[str, Any],
+        columns: Optional[list[str] | dict[str, str]] = None,
+        filter: Optional[Any] = None,
+        fast_search: bool = False,
+        scanner_options: Optional[dict[str, Any]] = None,
+    ) -> pa.Table:
+        """Search independently of other arrivals, without blocking the caller's loop."""
+        future = self._submit_search(
+            query,
+            nearest=nearest,
+            columns=columns,
+            filter=filter,
+            fast_search=fast_search,
+            scanner_options=scanner_options,
+        )
+        result, _ = await asyncio.wrap_future(future)
+        return cast(pa.Table, result)
+
+    def map_batches(
+        self,
+        query_batches: Iterable[Any],
+        *,
+        nearest: dict[str, Any],
+        columns: Optional[list[str] | dict[str, str]] = None,
+        filter: Optional[Any] = None,
+        fast_search: bool = False,
+        scanner_options: Optional[dict[str, Any]] = None,
+    ) -> Generator[pa.Table, None, None]:
+        """Search an iterable of query batches with bounded requests in flight.
+
+        The driver canonicalizes each input batch, places each query chunk in
+        Ray's object store once, broadcasts the resulting reference to all search
+        actors, merges their local candidates per query, and yields the completed
+        global top-k table. Requests share the session's
+        ``max_concurrent_requests`` limit. Close the iterator when abandoning a
+        stream.
 
         Args:
             query_batches: Iterable of regular vector batches shaped ``[B, D]``
-                or multivector batches described by :func:`open_vector_search`.
+                or multivector batches shaped ``[B, M, D]`` or a sequence of
+                ``[M_i, D]`` arrays.
 
         Yields:
             PyArrow tables in input-batch order. ``query_index`` is an Int64
             position in the complete stream, not an index local to the batch.
         """
-        if self._closed:
-            raise RuntimeError("VectorSearchSession is closed")
-
-        pending: deque[tuple[int, Any, list[Any]]] = deque()
-        global_offset = 0
-
-        def complete_one() -> pa.Table:
-            offset, query_batch, refs = pending.popleft()
-            tables = ray.get(refs) if refs else []
-            result = self._finish_batch(
-                tables,
-                query_batch=query_batch,
-                global_offset=offset,
-            )
-            return result
-
-        for query_batch in self._iter_batches(query_batches):
-            query_count = len(query_batch)
-            if query_count == 0:
-                continue
-            while len(pending) >= self._streaming_options.max_in_flight_batches:
-                yield complete_one()
-
-            query_ref = ray.put(query_batch)
-            refs = [
-                actor.search.remote(
-                    query_ref,
-                    self._nearest,
-                    self._candidate_k,
-                )
-                for actor in self._actors
-            ]
-            pending.append((global_offset, query_batch, refs))
-            global_offset += query_count
-
-        while pending:
-            yield complete_one()
-
-    def _iter_batches(self, query_batches: Iterable[Any]) -> Iterator[Any]:
-        import numpy as np
-
-        metric = _get_nearest_metric(self._nearest)
-        target = self._streaming_options.query_batch_size
-        if self._is_multivector:
-            buffered_queries: list[Any] = []
-            for query_batch in query_batches:
-                canonical = _canonical_multivector_batch(query_batch, metric)
-                if target is None:
-                    yield canonical
-                    continue
-                buffered_queries.extend(canonical)
-                while len(buffered_queries) >= target:
-                    yield tuple(buffered_queries[:target])
-                    del buffered_queries[:target]
-            if buffered_queries:
-                yield tuple(buffered_queries)
-            return
-
-        buffered = []
-        buffered_rows = 0
-        for query_batch in query_batches:
-            canonical = _canonical_query_batch(query_batch, metric)
-            if target is None:
-                yield canonical
-                continue
-            offset = 0
-            while offset < len(canonical):
-                take = min(target - buffered_rows, len(canonical) - offset)
-                buffered.append(canonical[offset : offset + take])
-                buffered_rows += take
-                offset += take
-                if buffered_rows == target:
-                    yield np.concatenate(buffered, axis=0)
-                    buffered.clear()
-                    buffered_rows = 0
-        if buffered:
-            yield np.concatenate(buffered, axis=0)
-
-    def _finish_batch(
-        self,
-        tables: list[pa.Table],
-        *,
-        query_batch: Any,
-        global_offset: int,
-    ) -> pa.Table:
-        if self._result_schema is None:
-            schema_query = query_batch[0] if self._is_multivector else query_batch
-            result_schema = _resolve_vector_search_schema(
-                self._dataset,
-                nearest={**self._nearest, "q": schema_query},
-                base_scanner_options=self._base_scanner_options,
-                include_row_id=self._include_row_id,
-            )
-            if self._is_multivector:
-                result_schema = pa.schema(
-                    [
-                        pa.field("query_index", pa.int64(), nullable=False),
-                        *result_schema,
-                    ]
-                )
-            else:
-                query_index = result_schema.get_field_index("query_index")
-                if query_index < 0:
-                    raise RuntimeError(
-                        "Batch search result schema is missing query_index"
-                    )
-                result_schema = result_schema.set(
-                    query_index,
-                    pa.field("query_index", pa.int64(), nullable=False),
-                )
-            self._result_schema = result_schema
-        result_schema = self._result_schema
-
-        if tables:
-            result = _merge_vector_search_results(
-                tables,
-                self._global_k,
-                per_query=True,
-            )
-        else:
-            result = pa.Table.from_batches([], schema=result_schema)
-
-        result = _offset_query_index(
-            result,
-            global_offset,
-            output_type=pa.int64(),
+        request = self._request_options(
+            nearest, columns, filter, fast_search, scanner_options
         )
-        if not self._include_row_id and "_rowid" in result.column_names:
-            result = result.drop_columns(["_rowid"])
-        return result.select(result_schema.names)
+        completed: queue.Queue[Any] = queue.Queue()
+        stop = threading.Event()
+        lock = threading.Lock()
+        owned: set[_RequestSlot] = set()
+        end = object()
+
+        def producer() -> None:
+            iterator: Any = None
+            held_slot = None
+            try:
+                iterator = iter(query_batches)
+                while not stop.is_set():
+                    with lock:
+                        if stop.is_set():
+                            break
+                        reservation = self._schedule(self._acquire(stop))
+                    slot = reservation.result()
+                    held_slot = slot
+                    with lock:
+                        owned.add(slot)
+                    if stop.is_set():
+                        break
+                    try:
+                        query = next(iterator)
+                    except StopIteration:
+                        self._cleanup_slot(slot)
+                        with lock:
+                            owned.discard(slot)
+                        held_slot = None
+                        break
+                    if stop.is_set():
+                        break
+                    future = self._schedule(
+                        self._execute(query, request, batch=True, slot=slot)
+                    )
+                    completed.put((slot, future))
+                    held_slot = None
+                    slot.input_consumed.wait()
+            except BaseException as exc:
+                completed.put(exc)
+            finally:
+                # Do not join this thread on close: next(iterator) can block in
+                # caller-owned I/O. Abandoned reservations are revoked below.
+                try:
+                    if held_slot is not None:
+                        self._cleanup_slot(held_slot, abandon=True)
+                    close_iterator = getattr(iterator, "close", None)
+                    if close_iterator is not None:
+                        close_iterator()
+                except BaseException as exc:
+                    completed.put(exc)
+                finally:
+                    completed.put(end)
+
+        thread = threading.Thread(
+            target=producer, name="lance-ray-query-input", daemon=True
+        )
+        thread.start()
+        offset = 0
+        try:
+            while True:
+                item = completed.get()
+                if item is end:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                slot, future = item
+                result, count = future.result()
+                result = _offset_query_index(result, offset, output_type=pa.int64())
+                offset += count
+                self._cleanup_slot(slot)
+                with lock:
+                    owned.discard(slot)
+                yield result
+        finally:
+            stop.set()
+            with lock:
+                slots = list(owned)
+            for slot in slots:
+                self._cleanup_slot(slot, abandon=True)
+
+    async def _drain(self) -> None:
+        async with self._capacity:
+            self._capacity.notify_all()
+        # Queued acquisitions wake and reject admission. Accepted requests keep
+        # running, even if a stream consumer is no longer pulling results.
+        tasks = [slot.task for slot in self._slots if slot.task is not None]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for slot in list(self._slots):
+            await self._release(slot)
+        await asyncio.sleep(0)
+        for actor in self._actors:
+            ray.kill(actor, no_restart=True)
+        self._actors.clear()
+        await self._loop.shutdown_default_executor()
+
+    def close(self) -> None:
+        """Reject new requests, drain accepted work, then release owned actors."""
+        with self._close_lock:
+            if self._closed.is_set():
+                return
+            already_closing = self._closing.is_set()
+            if not already_closing:
+                self._closing.set()
+                future = asyncio.run_coroutine_threadsafe(self._drain(), self._loop)
+        if already_closing:
+            self._closed.wait()
+            return
+        try:
+            future.result()
+        finally:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join()
+            self._loop.close()
+            self._closed.set()
+
+    async def aclose(self) -> None:
+        """Drain and close without blocking the caller's event loop."""
+        await asyncio.to_thread(self.close)
+
+
+def _is_batch_query(query: Any, multivector: bool) -> bool:
+    import numpy as np
+
+    if isinstance(query, pa.Table | pa.RecordBatch):
+        return True
+    if isinstance(query, pa.Array | pa.ChunkedArray):
+        data_type = query.type
+        list_like = (
+            pa.types.is_fixed_size_list(data_type)
+            or pa.types.is_list(data_type)
+            or pa.types.is_large_list(data_type)
+        )
+        if multivector:
+            return list_like and pa.types.is_fixed_size_list(data_type.value_type)
+        return list_like
+    try:
+        array = np.asarray(query)
+    except ValueError:
+        return True
+    return array.ndim >= (3 if multivector else 2) or array.size == 0
 
 
 def _build_driver_dataset(
@@ -1769,16 +2233,21 @@ def _build_driver_dataset(
         namespace_properties=namespace_properties,
         table_id=table_id,
     )
+    if isinstance(uri, LanceDataset):
+        # A caller can mutate its LanceDataset (e.g. add_columns). Keep the
+        # driver's schema planning pinned just like the actors' data scans.
+        dataset = _open_snapshot(
+            snapshot, index_cache_size_bytes=None, metadata_cache_size_bytes=None
+        )
     return dataset, snapshot
 
 
 def open_vector_search(
     uri: str | LanceDataset | None = None,
     *,
-    nearest: dict[str, Any],
+    column: str,
+    metric: Optional[str] = None,
     index_name: Optional[str] = None,
-    columns: Optional[list[str] | dict[str, str]] = None,
-    filter: Optional[Any] = None,
     storage_options: Optional[dict[str, Any]] = None,
     base_store_params: Optional[dict[str, dict[str, Any]]] = None,
     block_size: Optional[int] = None,
@@ -1787,40 +2256,29 @@ def open_vector_search(
     table_id: Optional[list[str]] = None,
     branch: Optional[str] = None,
     version: int | str | None = None,
-    oversample_factor: float = 1.0,
-    fast_search: bool = False,
-    scanner_options: Optional[dict[str, Any]] = None,
-    streaming_options: Optional[VectorSearchStreamingOptions] = None,
+    max_concurrent_requests: int = 4,
     actor_options: Optional[VectorSearchActorOptions] = None,
 ) -> VectorSearchSession:
     """Open a reusable distributed vector search session.
 
     The session pins the dataset manifest when it opens, assigns index segments
     and uncovered fragments to persistent Ray actors, and reuses each actor's
-    Lance session and index cache across query batches. Use the returned object
-    as a context manager so the actors are stopped when the stream finishes.
+    Lance session and index cache across requests. Use the returned object
+    as a context manager so the actors are stopped when the session closes.
 
-    Queries are supplied later through :meth:`VectorSearchSession.map_batches`;
-    do not include ``q`` in ``nearest``. For a fixed-size vector column, each
-    input batch is an array with shape ``[B, D]``. For a multivector column, an
-    input batch is a sequence of ``[M_i, D]`` arrays, an Arrow
-    ``List<FixedSizeList<D>>`` array, or a ``[B, M, D]`` array when ``M`` is
-    fixed. Every output table contains an Int64 ``query_index`` that identifies
-    the query's position across the entire input stream.
+    Queries and per-request options are supplied later through
+    :meth:`VectorSearchSession.search`, :meth:`VectorSearchSession.search_async`,
+    or :meth:`VectorSearchSession.map_batches`.
 
     Args:
         uri: Lance dataset object or dataset URI. In URI mode, provide either
             ``uri`` or namespace parameters (``namespace_impl`` + ``table_id``).
             An already checked-out dataset retains its exact manifest.
-        nearest: Lance nearest-neighbor options without ``q``. ``column`` and
-            ``k`` are required. Options such as ``nprobes``,
-            ``query_parallelism``, ``approx_mode``, ``refine_factor``, and
-            ``distance_range`` are forwarded to Lance Core.
+        column: Vector column to search for the lifetime of the session.
+        metric: Distance metric. If omitted, use the selected index's metric,
+            or L2 when no index exists.
         index_name: Optional vector index name. If omitted, the first vector
-            index covering ``nearest["column"]`` is selected.
-        columns: Columns or projection expressions returned for each match.
-            ``_distance`` is added when needed for distributed top-k merging.
-        filter: Filter passed to each actor's Lance scanner.
+            index covering ``column`` with a compatible metric is selected.
         storage_options: Storage options used to open the dataset.
         base_store_params: Runtime options for registered external base paths.
         block_size: Optional dataset I/O block size in bytes.
@@ -1832,15 +2290,10 @@ def open_vector_search(
             exclusive with ``version``.
         version: Dataset version or tag to pin. Mutually exclusive with
             ``branch``.
-        oversample_factor: Multiplier applied to each actor's local candidate
-            count before the driver performs the global top-k merge.
-        fast_search: If true, intentionally skip fragments not covered by the
-            selected vector index. If false, include them through flat fallback.
-        scanner_options: Additional Lance scanner options. ``nearest``,
-            ``fragments``, ``index_segments``, ``fast_search``, ``limit``, and
-            ``offset`` are managed by Lance-Ray and cannot be supplied here.
-        streaming_options: Input rebatching and bounded in-flight pipeline
-            settings.
+        max_concurrent_requests: Maximum number of requests in flight across
+            all entry points. Each stream input batch counts as one request,
+            retaining capacity until its result or error is delivered. Defaults
+            to 4. This limits request count, not bytes or result size.
         actor_options: Actor count, Ray resources, cache sizes, and optional
             index prewarming.
 
@@ -1850,50 +2303,19 @@ def open_vector_search(
     Example:
         >>> with open_vector_search(
         ...     "dataset.lance",
-        ...     nearest={"column": "vector", "k": 10, "nprobes": 8},
-        ...     streaming_options=VectorSearchStreamingOptions(
-        ...         query_batch_size=512,
-        ...         max_in_flight_batches=2,
-        ...     ),
-        ... ) as search:
-        ...     for result in search.map_batches(query_batches):
+        ...     column="vector",
+    ...     max_concurrent_requests=2,
+    ... ) as search:
+        ...     for result in search.map_batches(
+    ...         query_batches, nearest={"k": 10, "nprobes": 8}
+    ...     ):
         ...         write_result(result)
     """
-    streaming_options = streaming_options or VectorSearchStreamingOptions()
     actor_options = actor_options or VectorSearchActorOptions()
-
+    if not isinstance(max_concurrent_requests, int) or max_concurrent_requests <= 0:
+        raise ValueError("max_concurrent_requests must be a positive integer")
     if block_size is not None and block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}")
-    if "q" in nearest:
-        raise ValueError("open_vector_search receives queries through map_batches")
-    if not nearest.get("column"):
-        raise ValueError("nearest must include 'column'")
-    nearest = dict(nearest)
-    global_k, candidate_k = _candidate_k(nearest, oversample_factor)
-
-    base_scanner_options = dict(scanner_options or {})
-    _validate_search_scanner_options(base_scanner_options)
-    include_row_id = _projection_includes_row_id(columns, base_scanner_options)
-    effective_columns = (
-        columns if columns is not None else base_scanner_options.get("columns")
-    )
-    if effective_columns is not None:
-        if (
-            isinstance(effective_columns, list) and "query_index" in effective_columns
-        ) or (
-            isinstance(effective_columns, dict) and "query_index" in effective_columns
-        ):
-            raise ValueError(
-                "query_index is managed by streaming vector search and cannot "
-                "be included in columns"
-            )
-        if isinstance(effective_columns, list) and "_distance" not in effective_columns:
-            effective_columns = [*effective_columns, "_distance"]
-        base_scanner_options["columns"] = effective_columns
-    if filter is not None:
-        base_scanner_options["filter"] = filter
-    base_scanner_options["with_row_id"] = True
-
     dataset, snapshot = _build_driver_dataset(
         uri,
         storage_options=storage_options,
@@ -1910,50 +2332,73 @@ def open_vector_search(
             "Batch vector search cannot use a dataset containing column 'query_index'"
         )
     try:
-        resolved_field = resolve_arrow_field_path(
-            dataset.schema,
-            nearest["column"],
-        )
+        field = resolve_arrow_field_path(dataset.schema, column)
     except KeyError as exc:
-        available_columns = [field.name for field in dataset.schema]
+        raise ValueError(f"Column {column!r} not found in dataset") from exc
+    vector_type = field.field.type
+    if not (
+        pa.types.is_fixed_size_list(vector_type)
+        or _streaming_is_multivector_type(vector_type)
+    ):
         raise ValueError(
-            f"Column '{nearest['column']}' not found. Available: {available_columns}"
-        ) from exc
-    resolved_column = resolved_field.path
-    nearest = {**nearest, "column": resolved_column}
-
-    vector_index = _select_vector_index(
-        dataset,
-        column=resolved_column,
-        index_name=index_name,
-    )
-    resolved_index_name = (
-        str(_index_value(vector_index, "name")) if vector_index is not None else None
-    )
+            "Vector column must be FixedSizeList<D> or List<FixedSizeList<D>>"
+        )
+    metric = _normalize_metric(metric) if metric is not None else None
+    selected = None
+    for index in dataset.describe_indices():
+        name = str(_index_value(index, "name"))
+        if index_name is not None and name != index_name:
+            continue
+        fields = _index_value(index, "field_names")
+        if fields is None:
+            fields = _index_value(index, "fields", [])
+        if field.path not in _canonical_index_field_names(fields):
+            if index_name is not None:
+                raise ValueError(f"Index {index_name!r} does not cover {column!r}")
+            continue
+        # Scalar indexes on the same column cannot provide vector candidates.
+        if not str(_index_value(index, "index_type", "")).upper().startswith("IVF"):
+            if index_name is not None:
+                raise ValueError(f"Index {index_name!r} is not a vector index")
+            continue
+        index_metric = _normalize_metric(_get_index_metric(dataset, index))
+        if metric is not None and metric != index_metric:
+            if index_name is not None:
+                raise ValueError(
+                    f"Index metric {index_metric!r} does not match {metric!r}"
+                )
+            continue
+        selected = index
+        metric = index_metric
+        break
+    if index_name is not None and selected is None:
+        raise ValueError(f"Vector index {index_name!r} was not found")
+    metric = metric or "l2"
     plans = _plan_streaming_vector_search(
         fragments=dataset.get_fragments(),
-        vector_index=vector_index,
+        vector_index=selected,
         num_actors=actor_options.num_actors,
-        fast_search=fast_search,
     )
-    if (
-        vector_index is not None
-        and not (nearest.get("metric") or nearest.get("distance_type"))
-        and any(plan.fallback_fragment_ids for plan in plans)
-    ):
-        nearest = {**nearest, "metric": _get_index_metric(dataset, vector_index)}
-
     return VectorSearchSession(
         dataset=dataset,
-        vector_type=resolved_field.field.type,
+        vector_type=vector_type,
         snapshot=snapshot,
-        nearest=nearest,
-        index_name=resolved_index_name,
+        column=field.path,
+        metric=metric,
+        index_name=str(_index_value(selected, "name"))
+        if selected is not None
+        else None,
         plans=plans,
-        base_scanner_options=base_scanner_options,
-        include_row_id=include_row_id,
-        global_k=global_k,
-        candidate_k=candidate_k,
-        streaming_options=streaming_options,
+        max_concurrent_requests=max_concurrent_requests,
         actor_options=actor_options,
     )
+
+
+def _normalize_metric(metric: str) -> str:
+    metric = metric.lower()
+    metric = {"euclidean": "l2", "ip": "dot", "inner_product": "dot"}.get(
+        metric, metric
+    )
+    if metric not in {"l2", "cosine", "dot", "hamming"}:
+        raise ValueError(f"Unsupported vector search metric: {metric!r}")
+    return metric

@@ -26,7 +26,7 @@ from .io import (
 from .pool import clear_global_pool, get_global_pool, init_global_pool, set_global_pool
 from .search import (
     VectorSearchActorOptions,
-    VectorSearchStreamingOptions,
+    VectorSearchSession,
     open_vector_search,
     vector_search,
 )
@@ -36,7 +36,7 @@ __all__ = [
     "write_lance",
     "vector_search",
     "open_vector_search",
-    "VectorSearchStreamingOptions",
+    "VectorSearchSession",
     "VectorSearchActorOptions",
     "init_global_pool",
     "set_global_pool",
