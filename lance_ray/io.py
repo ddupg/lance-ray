@@ -221,9 +221,8 @@ def write_lance(
         max_bytes_per_file: The maximum number of bytes per file. This is a soft
             limit. If not provided, the PyLance default is used.
         data_storage_version: The version of the data storage format to use. Newer versions are more
-            efficient but require newer versions of lance to read.  The default is
-            "legacy" which will use the legacy v1 version.  See the user guide
-            for more details.
+            efficient but require newer versions of lance to read. The default
+            (None) uses PyLance's stable format.
         enable_stable_row_ids: Enable stable row IDs for the dataset and all
             fragments written by this operation. Default is False.
         storage_options: The storage options for the writer. Default is None.

@@ -38,3 +38,17 @@ Write a Ray Dataset to Lance format.
 - `concurrency`: Optional maximum number of concurrent Ray tasks
 
 **Returns:** None
+
+### Blob storage formats
+
+`data_storage_version=None` uses PyLance's default stable format. Legacy blob
+columns declared with `lance-encoding:blob=true` field metadata are supported by
+file formats 2.0 and 2.1. To write these columns, explicitly select a compatible
+format for both regular and streaming writes, for example:
+
+```python
+write_lance(ds, uri, data_storage_version="2.1")
+```
+
+To write blob columns in file formats 2.2 and later, use the Blob v2 extension
+type (`lance.blob.v2`), constructed with `lance.blob_field` and `lance.blob_array`.

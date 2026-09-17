@@ -122,18 +122,13 @@ def write_fragment(
     )
 
     def _write_fragments() -> list["FragmentMetadata"]:
-        # ``write_fragments`` is overloaded on ``return_transaction``. The
-        # version-dependent kwargs are assembled dynamically, which makes mypy
-        # pick the ``return_transaction=True`` overload; ``return_transaction``
-        # is left at its default here, so a list of fragments comes back.
-        return write_fragments(  # type: ignore[return-value]
+        return write_fragments(
             reader,
             uri,
+            return_transaction=False,
             schema=schema,
             max_rows_per_file=max_rows_per_file,
-            # ``None`` means "use the writer default" upstream, even though
-            # pylance annotates the parameter as a plain ``int``.
-            max_rows_per_group=max_rows_per_group,  # type: ignore[arg-type]
+            max_rows_per_group=max_rows_per_group,
             max_bytes_per_file=max_bytes_per_file,
             data_storage_version=data_storage_version,
             enable_stable_row_ids=enable_stable_row_ids,

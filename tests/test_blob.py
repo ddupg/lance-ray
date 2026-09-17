@@ -3,6 +3,8 @@
 This test ensures that pa.large_binary fields with metadata
 {"lance-encoding:blob": "true"} are written and read back with
 byte-for-byte fidelity using write_lance and read_lance.
+These tests explicitly use file format 2.1 to exercise legacy blob
+encoding, which is not supported by file formats 2.2 and later.
 
 Tests cover:
 - Single blob column round-trip
@@ -93,7 +95,7 @@ def test_single_blob_roundtrip(temp_dir: str) -> None:
 
     # Write via lance-ray
     ds_ray = ray.data.from_arrow(table)
-    lr.write_lance(ds_ray, str(path), schema=schema)
+    lr.write_lance(ds_ray, str(path), schema=schema, data_storage_version="2.1")
 
     # Read back via lance-ray
     ds_read = lr.read_lance(str(path))
@@ -134,7 +136,7 @@ def test_multi_blob_roundtrip(temp_dir: str) -> None:
 
     # Write via lance-ray
     ds_ray = ray.data.from_arrow(table)
-    lr.write_lance(ds_ray, str(path), schema=table.schema)
+    lr.write_lance(ds_ray, str(path), schema=table.schema, data_storage_version="2.1")
 
     # Read back via lance-ray
     ds_read = lr.read_lance(str(path))
@@ -173,7 +175,7 @@ def test_jpg_blob_integration(
     # Write via lance-ray
     path = Path(temp_dir) / "jpg_blob_integration.lance"
     ds_ray = ray.data.from_arrow(table)
-    lr.write_lance(ds_ray, str(path), schema=schema)
+    lr.write_lance(ds_ray, str(path), schema=schema, data_storage_version="2.1")
 
     # Read back via lance-ray
     ds_read = lr.read_lance(str(path))
@@ -223,7 +225,7 @@ def test_blob_projection_and_filter(temp_dir: str) -> None:
     )
 
     ds_ray = ray.data.from_arrow(table)
-    lr.write_lance(ds_ray, str(path), schema=schema)
+    lr.write_lance(ds_ray, str(path), schema=schema, data_storage_version="2.1")
 
     # Read only blob column with a filter
     ds_read = lr.read_lance(str(path), columns=["blob"], filter="id >= 12")
@@ -259,7 +261,7 @@ def test_multi_blob_projection_and_filter(temp_dir: str) -> None:
     )
 
     ds_ray = ray.data.from_arrow(table)
-    lr.write_lance(ds_ray, str(path), schema=table.schema)
+    lr.write_lance(ds_ray, str(path), schema=table.schema, data_storage_version="2.1")
 
     # Read only blob columns with a filter on id
     ds_read = lr.read_lance(str(path), columns=["blob1", "blob2"], filter="id >= 2")
@@ -309,11 +311,15 @@ def test_stream_copy_basic_local(temp_dir: str) -> None:
 
     # Write source with legacy data storage version
     ds_src_arrow = ray.data.from_arrow(table)
-    lr.write_lance(ds_src_arrow, str(src_path), schema=schema)
+    lr.write_lance(
+        ds_src_arrow, str(src_path), schema=schema, data_storage_version="2.1"
+    )
 
     ds_src = ray.data.from_arrow(table)
 
-    lr.write_lance(ds_src, str(dst_path), stream=True, batch_size=1)
+    lr.write_lance(
+        ds_src, str(dst_path), stream=True, batch_size=1, data_storage_version="2.1"
+    )
 
     src = lance.dataset(str(src_path))
     dst = lance.dataset(str(dst_path))
@@ -357,11 +363,18 @@ def test_stream_copy_resume_local(temp_dir: str) -> None:
 
     # Write source as legacy format
     ds_src_arrow = ray.data.from_arrow(table)
-    lr.write_lance(ds_src_arrow, str(src_path), schema=schema)
+    lr.write_lance(
+        ds_src_arrow, str(src_path), schema=schema, data_storage_version="2.1"
+    )
 
-    # Pre-create destination with first 2 rows (default stable format)
+    # Pre-create destination with first 2 rows in the legacy blob format.
     table_first2 = table.slice(0, 2)
-    lr.write_lance(ray.data.from_arrow(table_first2), str(dst_path), schema=schema)
+    lr.write_lance(
+        ray.data.from_arrow(table_first2),
+        str(dst_path),
+        schema=schema,
+        data_storage_version="2.1",
+    )
 
     ds_src = ray.data.from_arrow(table)
 
@@ -372,6 +385,7 @@ def test_stream_copy_resume_local(temp_dir: str) -> None:
         batch_size=2,
         resume_rows=2,
         mode="append",
+        data_storage_version="2.1",
     )
 
     src_df = (
