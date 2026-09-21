@@ -231,6 +231,9 @@ def _prepare_write_fragments_options(
     allow_external_blob_outside_bases: bool,
     stacklevel: int,
 ) -> tuple[Mapping[str, inspect.Parameter], bool]:
+    if target_bases and target_all_bases is not None:
+        raise ValueError("'target_bases' and 'target_all_bases' are mutually exclusive")
+
     params = inspect.signature(write_fragments).parameters
 
     if target_bases is not None and "target_bases" not in params:
