@@ -1049,7 +1049,7 @@ def _open_snapshot(
 ) -> LanceDataset:
     import lance
 
-    session = lance.Session(  # type: ignore[call-arg]
+    session = lance.Session(
         index_cache_size_bytes=index_cache_size_bytes,
         metadata_cache_size_bytes=metadata_cache_size_bytes,
     )
@@ -1392,7 +1392,6 @@ def _multivector_fallback_search(
     nearest: dict[str, Any],
     candidate_k: int,
 ) -> pa.Table:
-    query = nearest["q"]
     scanner_options = dict(base_scanner_options)
     scanner_options.pop("fast_search", None)
     scanner_options["fragments"] = [
@@ -1406,19 +1405,6 @@ def _multivector_fallback_search(
     scanner_options["nearest"] = search_nearest
     table = dataset.scanner(**scanner_options).to_table()
 
-    query_count = len(query)
-    if query_count > 1 and table.num_rows:
-        # Remove this compatibility offset once the minimum Core version uses
-        # M - sum(MaxSim) for flat multivector distance.
-        distances = pc.add(
-            table["_distance"],
-            pa.scalar(float(query_count - 1), pa.float32()),
-        )
-        table = table.set_column(
-            table.schema.get_field_index("_distance"),
-            pa.field("_distance", pa.float32()),
-            distances,
-        )
     if distance_range is not None:
         table = _apply_distance_range(
             table,
@@ -1505,9 +1491,7 @@ class _VectorSearchActor:
             fragments = ()
         if not index_segments and not fragments:
             return pa.table({})
-        # PyLance's 2-D query conversion uses float32. Keep packed Hamming
-        # vectors uint8 by issuing native single-query searches inside the actor.
-        if self._is_multivector or _get_nearest_metric(nearest) == "hamming":
+        if self._is_multivector:
             results = [
                 _add_query_index(
                     _search_vector_shard(
