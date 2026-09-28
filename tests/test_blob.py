@@ -72,6 +72,36 @@ def _generate_jpg_bytes() -> bytes:
             return os.urandom(64 * 64 * 3)
 
 
+@pytest.mark.parametrize("provide_schema", [True, False])
+def test_legacy_blob_requires_explicit_version(
+    temp_dir: str, provide_schema: bool
+) -> None:
+    """Reject legacy blobs before dispatch when the file version is omitted."""
+    path = Path(temp_dir) / "legacy_blob_default_version.lance"
+    schema_fields: list[pa.Field[Any]] = [
+        pa.field(
+            "blob",
+            pa.large_binary(),
+            metadata={"lance-encoding:blob": "true"},
+        ),
+        pa.field("id", pa.int64()),
+    ]
+    schema = pa.schema(schema_fields)
+    table = pa.table({"blob": [b"foo", None], "id": [1, 2]}, schema=schema)
+
+    with pytest.raises(ValueError) as exc_info:
+        lr.write_lance(
+            ray.data.from_arrow(table),
+            str(path),
+            schema=schema if provide_schema else None,
+        )
+
+    message = str(exc_info.value)
+    assert "blob" in message
+    assert 'data_storage_version="2.1"' in message
+    assert "Blob v2" in message
+
+
 def test_single_blob_roundtrip(temp_dir: str) -> None:
     """Test single blob column round-trip."""
     path = Path(temp_dir) / "single_blob_roundtrip.lance"

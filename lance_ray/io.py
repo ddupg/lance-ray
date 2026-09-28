@@ -222,7 +222,8 @@ def write_lance(
             limit. If not provided, the PyLance default is used.
         data_storage_version: The version of the data storage format to use. Newer versions are more
             efficient but require newer versions of lance to read. The default
-            (None) uses PyLance's stable format.
+            (None) uses PyLance's stable format. Legacy blob columns require an
+            explicit compatible version such as "2.1".
         enable_stable_row_ids: Enable stable row IDs for the dataset and all
             fragments written by this operation. Default is False.
         storage_options: The storage options for the writer. Default is None.
@@ -261,6 +262,13 @@ def write_lance(
         stacklevel=2,
     )
     initial_bases = normalize_initial_bases(initial_bases)
+    if data_storage_version is None:
+        write_schema = schema
+        if write_schema is None:
+            ray_schema = ds.schema()
+            if ray_schema is not None and isinstance(ray_schema.base_schema, pa.Schema):
+                write_schema = ray_schema.base_schema
+        _validate_legacy_blob_storage_version(write_schema)
 
     # Fast path: non-streaming write using the Datasink API.
     if not stream:
@@ -1207,4 +1215,27 @@ def _validate_write_args(
     if uri is None and not has_ns:
         raise ValueError(
             "Must provide either 'uri' OR ('namespace_impl' + 'table_id')."
+        )
+
+
+def _validate_legacy_blob_storage_version(schema: Optional[pa.Schema]) -> None:
+    if schema is None:
+        return
+
+    def legacy_blob_paths(field: "pa.Field[Any]", parent: str = "") -> list[str]:
+        path = f"{parent}.{field.name}" if parent else field.name
+        metadata = field.metadata or {}
+        paths = [path] if metadata.get(b"lance-encoding:blob") == b"true" else []
+        if pa.types.is_struct(field.type):
+            for child in field.type:
+                paths.extend(legacy_blob_paths(child, path))
+        return paths
+
+    paths = [path for field in schema for path in legacy_blob_paths(field)]
+    if paths:
+        fields = ", ".join(repr(path) for path in paths)
+        raise ValueError(
+            f"Legacy blob field(s) {fields} are incompatible with the default "
+            'stable data storage version. Set data_storage_version="2.1" to '
+            "keep using legacy blob encoding, or migrate the field(s) to Blob v2."
         )
