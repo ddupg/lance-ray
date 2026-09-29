@@ -90,6 +90,7 @@ def _select_vector_index(
     *,
     column: str,
     index_name: Optional[str],
+    metric: Optional[str] = None,
 ) -> Any | None:
     indices = dataset.describe_indices()
     for index in indices:
@@ -98,13 +99,28 @@ def _select_vector_index(
         if field_names is None:
             field_names = _index_value(index, "fields", [])
 
-        if index_name is not None:
-            if name == index_name:
-                return index
+        is_requested_index = index_name is not None and name == index_name
+        if index_name is not None and not is_requested_index:
             continue
 
-        if column in _canonical_index_field_names(field_names):
-            return index
+        if column not in _canonical_index_field_names(field_names):
+            if is_requested_index:
+                raise ValueError(
+                    f"Vector index '{index_name}' does not cover column '{column}'"
+                )
+            continue
+
+        if metric is not None:
+            index_metric = _get_index_metric(dataset, index)
+            if _canonical_metric(metric) != _canonical_metric(index_metric):
+                if is_requested_index:
+                    raise ValueError(
+                        f"Vector index '{index_name}' uses metric '{index_metric}', "
+                        f"not requested metric '{metric}'"
+                    )
+                continue
+
+        return index
 
     if index_name is not None:
         available_names = [str(_index_value(index, "name")) for index in indices]
@@ -124,6 +140,15 @@ def _canonical_index_field_names(field_names: Any) -> set[str]:
         except ValueError:
             canonical_names.add(str(field_name))
     return canonical_names
+
+
+def _canonical_metric(metric: str) -> str:
+    normalized = metric.lower()
+    if normalized == "euclidean":
+        return "l2"
+    if normalized in ("ip", "inner_product"):
+        return "dot"
+    return normalized
 
 
 def _plan_vector_search(
@@ -622,8 +647,9 @@ def vector_search(
             metric, or L2 when no index exists.  L2 distances are squared and
             dot distances are ``1 - dot(q, v)``, matching Lance.
         index_name: Optional vector index name to use.  If specified and the
-            index cannot be found, ``ValueError`` is raised.  If omitted,
-            Lance-Ray uses the first vector index covering ``nearest["column"]``.
+            index cannot be found or is incompatible with the requested column
+            or metric, ``ValueError`` is raised.  If omitted, Lance-Ray uses the
+            first compatible vector index.
         columns: Projection passed to the Lance scanner.  When a list is
             provided, ``_distance`` is appended automatically because the driver
             needs it to merge global top-k results.
@@ -725,6 +751,7 @@ def vector_search(
         dataset,
         column=column,
         index_name=index_name,
+        metric=nearest.get("metric") or nearest.get("distance_type"),
     )
     if vector_index is None:
         logger.info(
