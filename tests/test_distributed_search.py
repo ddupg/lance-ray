@@ -41,11 +41,17 @@ class _FakeFragment:
         return self._rows
 
 
-def _index_with_segments(*segments: Any) -> SimpleNamespace:
+def _index_with_segments(
+    *segments: Any,
+    name: str = "vector_idx",
+    field_names: list[str] | None = None,
+    metric: str = "L2",
+) -> SimpleNamespace:
     return SimpleNamespace(
-        name="vector_idx",
-        field_names=["vector"],
+        name=name,
+        field_names=["vector"] if field_names is None else field_names,
         index_type="IVF_PQ",
+        details={"metric_type": metric},
         segments=[
             SimpleNamespace(uuid=uuid, fragment_ids=set(fragment_ids))
             for uuid, fragment_ids in segments
@@ -148,6 +154,7 @@ def test_select_vector_index_matches_canonical_lance_field_path() -> None:
         name="hyphen_idx",
         field_names=["`meta-data`.`user-id`"],
         index_type="IVF_PQ",
+        details={"metric_type": "L2"},
         segments=[],
     )
     dataset: Any = SimpleNamespace(describe_indices=lambda: [index])
@@ -159,6 +166,53 @@ def test_select_vector_index_matches_canonical_lance_field_path() -> None:
             index_name=None,
         )
         is index
+    )
+
+
+@pytest.mark.parametrize(
+    ("index", "error"),
+    [
+        (
+            _index_with_segments(field_names=["other_vector"]),
+            "does not cover column 'vector'",
+        ),
+        (
+            _index_with_segments(metric="COSINE"),
+            "metric 'cosine' does not match requested metric 'l2'",
+        ),
+    ],
+)
+def test_select_vector_index_validates_explicit_index(
+    index: SimpleNamespace,
+    error: str,
+) -> None:
+    dataset: Any = SimpleNamespace(describe_indices=lambda: [index])
+
+    with pytest.raises(ValueError, match=error):
+        _select_vector_index(
+            dataset,
+            column="vector",
+            index_name="vector_idx",
+            metric="l2",
+        )
+
+
+def test_select_vector_index_skips_incompatible_automatic_candidates() -> None:
+    incompatible = [
+        _index_with_segments(name="other_column_idx", field_names=["other_vector"]),
+        _index_with_segments(name="cosine_idx", metric="COSINE"),
+    ]
+    compatible = _index_with_segments(name="l2_idx")
+    dataset: Any = SimpleNamespace(describe_indices=lambda: [*incompatible, compatible])
+
+    assert (
+        _select_vector_index(
+            dataset,
+            column="vector",
+            index_name=None,
+            metric="euclidean",
+        )
+        is compatible
     )
 
 
