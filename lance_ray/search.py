@@ -97,6 +97,7 @@ def _select_vector_index(
     *,
     column: str,
     index_name: Optional[str],
+    metric: Optional[str] = None,
 ) -> Any | None:
     indices = dataset.describe_indices()
     for index in indices:
@@ -105,13 +106,28 @@ def _select_vector_index(
         if field_names is None:
             field_names = _index_value(index, "fields", [])
 
-        if index_name is not None:
-            if name == index_name:
-                return index
+        is_requested_index = index_name is not None and name == index_name
+        if index_name is not None and not is_requested_index:
             continue
 
-        if column in _canonical_index_field_names(field_names):
-            return index
+        if column not in _canonical_index_field_names(field_names):
+            if is_requested_index:
+                raise ValueError(
+                    f"Vector index '{index_name}' does not cover column '{column}'"
+                )
+            continue
+
+        if metric is not None:
+            index_metric = _get_index_metric(dataset, index)
+            if _normalize_metric(metric) != _normalize_metric(index_metric):
+                if is_requested_index:
+                    raise ValueError(
+                        f"Vector index '{index_name}' metric '{index_metric}' "
+                        f"does not match requested metric '{metric}'"
+                    )
+                continue
+
+        return index
 
     if index_name is not None:
         available_names = [str(_index_value(index, "name")) for index in indices]
@@ -676,9 +692,9 @@ def vector_search(
             metric, or L2 when no index exists.  L2 distances are squared and
             dot distances are ``1 - dot(q, v)``, matching Lance.
         index_name: Optional vector index name to use.  If specified and the
-            index cannot be found, ``ValueError`` is raised.  If omitted,
-            Lance-Ray uses the first vector index covering ``nearest["column"]``
-            with a compatible metric.
+            index cannot be found or is incompatible with the requested column
+            or metric, ``ValueError`` is raised.  If omitted, Lance-Ray uses the
+            first compatible vector index.
         columns: Projection passed to the Lance scanner.  When a list is
             provided, ``_distance`` is appended automatically because the driver
             needs it to merge global top-k results.
@@ -821,6 +837,7 @@ def vector_search(
         dataset,
         column=column,
         index_name=index_name,
+        metric=nearest.get("metric") or nearest.get("distance_type"),
     )
     if vector_index is None:
         logger.info(
@@ -2328,35 +2345,14 @@ def open_vector_search(
             "Vector column must be FixedSizeList<D> or List<FixedSizeList<D>>"
         )
     metric = _normalize_metric(metric) if metric is not None else None
-    selected = None
-    for index in dataset.describe_indices():
-        name = str(_index_value(index, "name"))
-        if index_name is not None and name != index_name:
-            continue
-        fields = _index_value(index, "field_names")
-        if fields is None:
-            fields = _index_value(index, "fields", [])
-        if field.path not in _canonical_index_field_names(fields):
-            if index_name is not None:
-                raise ValueError(f"Index {index_name!r} does not cover {column!r}")
-            continue
-        # Scalar indexes on the same column cannot provide vector candidates.
-        if not str(_index_value(index, "index_type", "")).upper().startswith("IVF"):
-            if index_name is not None:
-                raise ValueError(f"Index {index_name!r} is not a vector index")
-            continue
-        index_metric = _normalize_metric(_get_index_metric(dataset, index))
-        if metric is not None and metric != index_metric:
-            if index_name is not None:
-                raise ValueError(
-                    f"Index metric {index_metric!r} does not match {metric!r}"
-                )
-            continue
-        selected = index
-        metric = index_metric
-        break
-    if index_name is not None and selected is None:
-        raise ValueError(f"Vector index {index_name!r} was not found")
+    selected = _select_vector_index(
+        dataset,
+        column=field.path,
+        index_name=index_name,
+        metric=metric,
+    )
+    if selected is not None:
+        metric = _normalize_metric(_get_index_metric(dataset, selected))
     metric = metric or "l2"
     plans = _plan_streaming_vector_search(
         fragments=dataset.get_fragments(),
